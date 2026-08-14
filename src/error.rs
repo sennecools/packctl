@@ -30,10 +30,7 @@ pub enum PackError {
     },
 
     #[error("{message}\n\npath: {path}")]
-    Path {
-        message: String,
-        path: PathBuf,
-    },
+    Path { message: String, path: PathBuf },
 
     #[error("provider error: {0}")]
     Provider(String),
