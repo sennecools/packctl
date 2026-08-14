@@ -59,22 +59,25 @@ Requires Linux (x86_64 or arm64). The quickest way is the installer script, whic
 curl -fsSL https://raw.githubusercontent.com/sennecools/packctl/main/install.sh | sh
 ```
 
-As a normal user it installs to `~/.local/bin`; run it with `sudo` (or as root) to install to `/usr/local/bin`. Override the version or destination with environment variables:
+As a normal user it installs to `~/.local/bin`; run it with `sudo` (or as root) to install to `/usr/local/bin`. The script passes the release and install directory positionally to `sh`:
 
 ```bash
-VERSION=v0.1.0 INSTALL_DIR=$HOME/bin \
-  curl -fsSL https://raw.githubusercontent.com/sennecools/packctl/main/install.sh | sh
+# latest stable release (default)
+curl -fsSL https://raw.githubusercontent.com/sennecools/packctl/main/install.sh | sh
+# a specific release into a custom directory
+curl -fsSL https://raw.githubusercontent.com/sennecools/packctl/main/install.sh | sh -s v0.1.0 "$HOME/bin"
 ```
 
 Every commit to `main` is built automatically and published to a `rolling`
 prerelease. To install the very latest commit build:
 
 ```bash
-VERSION=rolling \
-  curl -fsSL https://raw.githubusercontent.com/sennecools/packctl/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/sennecools/packctl/main/install.sh | sh -s rolling
 ```
 
 Stable tagged releases remain the default (`latest`).
+
+Binaries are statically linked (musl), so they run on any glibc-based Linux.
 
 Or build from source with a Rust toolchain:
 

@@ -5,18 +5,20 @@ set -eu
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/sennecools/packctl/main/install.sh | sh
-#   VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/sennecools/packctl/main/install.sh | sh
-#   INSTALL_DIR=$HOME/bin curl -fsSL ... | sh
+#   curl -fsSL https://raw.githubusercontent.com/sennecools/packctl/main/install.sh | sh -s v0.1.0
+#   curl -fsSL https://raw.githubusercontent.com/sennecools/packctl/main/install.sh | sh -s rolling
+#   curl -fsSL ... | sh -s rolling /usr/local/bin
 #
-# Overridable via environment:
+# Overridable via environment (or positionally, via `sh -s`):
 #   VERSION       release tag to install (default: latest; "rolling" installs
 #                 the latest continuous build from main)
 #   INSTALL_DIR   directory to install into (default: /usr/local/bin as root,
 #                 else $HOME/.local/bin)
 
 REPO="${PACKCTL_REPO:-sennecools/packctl}"
-VERSION="${VERSION:-latest}"
-INSTALL_DIR="${INSTALL_DIR:-}"
+VERSION="${1:-${VERSION:-latest}}"
+shift 2>/dev/null || true
+INSTALL_DIR="${1:-${INSTALL_DIR:-}}"
 
 say() { printf 'packctl: %s\n' "$*"; }
 die() { say "$*" >&2; exit 1; }
