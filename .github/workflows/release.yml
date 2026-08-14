@@ -46,7 +46,7 @@ jobs:
           tar -C dist -czf "dist/packctl-${{ matrix.target }}.tar.gz" "packctl-${{ matrix.target }}"
 
       - name: Upload archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: packctl-${{ matrix.target }}
           path: dist/packctl-${{ matrix.target }}.tar.gz
@@ -58,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: artifacts
           pattern: packctl-*
