@@ -53,16 +53,24 @@ Preparation happens entirely before this: the target version is resolved, downlo
 
 ## Installation
 
-Requires Linux and a Rust toolchain. Build and install:
+Requires Linux (x86_64 or arm64). The quickest way is the installer script, which downloads the latest prebuilt binary from [GitHub Releases](https://github.com/sennecools/packctl/releases):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sennecools/packctl/main/install.sh | sh
+```
+
+As a normal user it installs to `~/.local/bin`; run it with `sudo` (or as root) to install to `/usr/local/bin`. Override the version or destination with environment variables:
+
+```bash
+VERSION=v0.1.0 INSTALL_DIR=$HOME/bin \
+  curl -fsSL https://raw.githubusercontent.com/sennecools/packctl/main/install.sh | sh
+```
+
+Or build from source with a Rust toolchain:
 
 ```bash
 cargo build --release
 # binary: target/release/packctl
-```
-
-Optionally copy it into your `PATH`:
-
-```bash
 sudo install -m 0755 target/release/packctl /usr/local/bin/packctl
 ```
 

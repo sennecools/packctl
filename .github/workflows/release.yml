@@ -1,0 +1,79 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build-${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Native toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build x86_64
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Build aarch64 (cross)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        uses: cross-rs/cross-action@v0
+        with:
+          target: aarch64-unknown-linux-gnu
+          command: build
+          args: --release
+
+      - name: Stage archive
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/packctl" "dist/packctl-${{ matrix.target }}"
+          tar -C dist -czf "dist/packctl-${{ matrix.target }}.tar.gz" "packctl-${{ matrix.target }}"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: packctl-${{ matrix.target }}
+          path: dist/packctl-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: packctl-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: artifacts
+        run: sha256sum packctl-*.tar.gz > SHA256SUMS
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/packctl-*.tar.gz
+            artifacts/SHA256SUMS
+          generate_release_notes: true
