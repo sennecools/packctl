@@ -4,6 +4,9 @@
 # paths to match your host. The profile directory is $PACKCTL_HOME if set,
 # otherwise $XDG_CONFIG_HOME/packctl (default ~/.config/packctl).
 #
+# Easier: run `packctl create` inside the server root. It writes a local
+# .packctl.toml with relative paths and can store your API key encrypted.
+#
 # Commands then use the profile name:
 #   packctl status atm10
 #   packctl plan atm10

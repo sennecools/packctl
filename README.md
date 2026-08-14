@@ -101,62 +101,107 @@ id still works without a key.
 
 ## Configuration
 
-Each server is one TOML profile. The easiest way to create one is:
+Each server is one TOML profile. The easiest setup lives **inside the server
+root**: `cd` into the server directory and run `packctl create`. It writes a
+`.packctl.toml` file there, and every later command just works from that
+directory without passing a server name:
 
 ```bash
-cd /srv/AlltheMods10
+cd /amp/instances/AllTheMods10
 packctl create atm10
 ```
 
 `packctl create` asks for the CurseForge modpack (a URL like
 `https://www.curseforge.com/minecraft/modpacks/all-the-mods-10`, a numeric
-project id, or a slug), the server root, the overlay directory, and how the
-server process is controlled, then writes the profile. You can `cd` into a
-directory and accept the defaults to get a working profile:
+project id, or a slug), an optional API key, and how the server process is
+controlled. The server root defaults to the current directory and the overlay
+to `<server root>/overlay`, so the instance stays fully visible to your
+control panel without extra virtual directories:
 
 ```text
-Server profile name [AlltheMods10]: atm10
-CurseForge modpack URL or project ID: https://www.curseforge.com/minecraft/modpacks/all-the-mods-10
-Found 'All the Mods 10' (project 925200)? [Y/n] y
-Server root [/srv/AlltheMods10]:
-Overlay directory [/srv/AlltheMods10/overlay]:
+Server profile name [AllTheMods10]: atm10
+CurseForge modpack URL or project ID: 925200
+CurseForge API key (optional, stored encrypted): <typed or empty>
+Found 'project 925200' (project 925200)? [Y/n] y
+Server root [/amp/instances/AllTheMods10]:
+Overlay directory [/amp/instances/AllTheMods10/overlay]:
 Server controller: amp
 AMP instance name [atm10]: ATM10
 
 Created profile 'atm10'
-  file:       ~/.config/packctl/atm10.toml
-  pack:       All the Mods 10 (project 925200)
-  server:     /srv/AlltheMods10
-  overlay:    /srv/AlltheMods10/overlay
+  file:       /amp/instances/AllTheMods10/.packctl.toml
+  pack:       project 925200 (project 925200)
+  server:     /amp/instances/AllTheMods10
+  overlay:    /amp/instances/AllTheMods10/overlay
   controller: amp (instance ATM10)
+  api key:    stored (encrypted)
 
-Next: packctl status atm10
+Next: packctl status
 ```
 
-Resolving a URL or slug looks the project up through the CurseForge API, which
-needs the `CF_API_KEY` environment variable. A numeric project id works without
-a key. Every value can be supplied as a flag instead of a prompt for
-scripting, e.g.:
+The generated file uses relative paths, so it stays valid if the instance
+directory moves:
+
+```toml
+name = "atm10"
+
+[server]
+root = "."
+
+[pack]
+provider = "curseforge"
+project_id = 925200
+
+[overlay]
+path = "overlay"
+
+[controller]
+type = "amp"
+instance = "ATM10"
+```
+
+Every value can be supplied as a flag instead of a prompt for scripting, e.g.:
 
 ```bash
-packctl create atm10 --source 925200 \
-  --root /srv/AlltheMods10 \
+packctl create atm10 --source 925200 --apikey "$CF_API_KEY" \
   --controller command \
   --status "pgrep -f server.jar" \
   --stop "screen -S atm10 -X stuff \"stop\n\"" \
   --start "screen -S atm10 -X stuff \"start\n\""
 ```
 
-If you prefer to write the file by hand, create `<name>.toml` in the profile
-directory, which is resolved in this order:
+### API key storage
+
+The CurseForge API requires a free key (<https://console.curseforge.com/>).
+`packctl` reads it from `$CF_API_KEY` if set, otherwise from the profile. When
+you store it in the profile it is **encrypted at rest** with AES-256-GCM; the
+per-user decryption key lives in `~/.config/packctl/.key` (0600), never inside
+the server root, so a plain API key is not readable from backups or control
+panels. Manage it with:
+
+```bash
+packctl apikey            # prompt to store a key
+packctl apikey --set "..."
+packctl apikey --remove
+```
+
+The master key is created the first time you store a secret. Because it
+protects only against *file readers* — anyone with shell access as your user
+can read the `.key` file — the decrypted key never appears in logs or output.
+
+### Global profiles
+
+If you prefer one profile directory for many servers, pass `--global` to
+`create` (writes `<name>.toml` to the profile directory, resolved in this
+order) and use the server name with every command:
 
 1. `$PACKCTL_HOME` if set
 2. `$XDG_CONFIG_HOME/packctl`, or `~/.config/packctl` by default
 3. `./packctl` (relative to the current directory) as a fallback
 
-The file name (minus `.toml`) is the profile name you pass to commands; the optional `name` field overrides the display name.
-
-A complete commented example lives at [`examples/atm10.toml`](examples/atm10.toml). The fields:
+The file name (minus `.toml`) is the profile name; the optional `name` field
+overrides the display name. A complete commented example lives at
+[`examples/atm10.toml`](examples/atm10.toml). The fields:
 
 | Field | Meaning |
 | --- | --- |
@@ -228,8 +273,9 @@ Everything else under the server root is treated as updater-managed content.
 | Command | Description |
 | --- | --- |
 | `packctl list` | List configured server profiles. |
-| `packctl create <server> [--source <url\|id\|slug>] [--root <path>] ...` | Interactively create a new server profile. `--non-interactive`/`-n` requires every value as a flag; `--force`/`-f` overwrites an existing profile. |
+| `packctl create <server> [--source <url\|id\|slug>] [--apikey <key>] [--global] ...` | Interactively create a server profile. Defaults to a local `.packctl.toml` in the current directory; `--global` writes to the profile directory instead. `-n`/`--non-interactive` requires every value as a flag; `-f`/`--force` overwrites. |
 | `packctl status <server>` | Show installed version, last update, managed-file count, snapshot count, and controller status. Local only, no network. |
+| `packctl apikey <server> [--set <key>] [--remove]` | Store, show, or remove the encrypted CurseForge API key. |
 | `packctl versions <server> [--json]` | List available upstream versions. `-j`/`--json` prints an array of `{id, name, released}`. |
 | `packctl plan <server> [version] [--verbose]` | Preview an update without changing anything. `-v`/`--verbose` lists every file. |
 | `packctl update <server> [version] [--non-interactive] [--verbose]` | Apply an update. Interactive prompts select the version (when omitted) and confirm before applying. |

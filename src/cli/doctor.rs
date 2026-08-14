@@ -10,8 +10,8 @@ use crate::core::validation::{Severity, ValidationIssue, has_errors, validate};
 use crate::error::{PackError, Result};
 
 /// Runs the environment checks for a server profile and prints the results.
-pub async fn run(server: &str) -> Result<()> {
-    let profile = crate::config::profile::load_profile(server)?;
+pub async fn run(server: Option<&str>) -> Result<()> {
+    let profile = crate::config::profile::resolve_profile(server)?;
     let updater = Updater::from_profile(&profile)?;
 
     let overlay_files = OverlayEngine::new(profile.overlay.path.clone()).scan()?;

@@ -14,3 +14,6 @@ pub mod core;
 pub mod error;
 pub mod fs;
 pub mod providers;
+
+#[cfg(test)]
+pub mod testutil;

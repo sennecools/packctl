@@ -3,6 +3,7 @@
 //! CLI modules translate user input into domain operations. They must not
 //! contain the actual update algorithm; all decisions live in the core.
 
+pub mod apikey;
 pub mod create;
 pub mod doctor;
 pub mod plan;
@@ -32,6 +33,10 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
+// The `create` variant carries many optional flags; that is inherent to a
+// command-line interface and not worth boxing every variant to appease the
+// size lint.
+#[allow(clippy::large_enum_variant)]
 pub enum Command {
     /// List configured server profiles
     List,
@@ -45,9 +50,16 @@ pub enum Command {
         /// Overwrite the profile if it already exists
         #[arg(long, short = 'f')]
         force: bool,
+        /// Write the profile into the global profile directory instead of the
+        /// current directory
+        #[arg(long)]
+        global: bool,
         /// CurseForge modpack URL, project ID, or slug (defaults to a prompt)
         #[arg(long)]
         source: Option<String>,
+        /// CurseForge API key to store (encrypted) with the new profile
+        #[arg(long)]
+        apikey: Option<String>,
         /// Server root directory (defaults to the current directory)
         #[arg(long)]
         root: Option<PathBuf>,
@@ -75,21 +87,32 @@ pub enum Command {
     },
     /// Show the current state of a server
     Status {
-        /// Server profile name
-        server: String,
+        /// Server profile name (or use .packctl.toml in the current directory)
+        server: Option<String>,
+    },
+    /// Store, show, or remove the encrypted CurseForge API key for a server
+    Apikey {
+        /// Server profile name (or use .packctl.toml in the current directory)
+        server: Option<String>,
+        /// Set the API key to this value (otherwise prompted)
+        #[arg(long)]
+        set: Option<String>,
+        /// Remove the stored API key
+        #[arg(long)]
+        remove: bool,
     },
     /// List available upstream versions for a server
     Versions {
-        /// Server profile name
-        server: String,
+        /// Server profile name (or use .packctl.toml in the current directory)
+        server: Option<String>,
         /// Print versions as JSON
         #[arg(long, short = 'j')]
         json: bool,
     },
     /// Show what an update would do without changing anything
     Plan {
-        /// Server profile name
-        server: String,
+        /// Server profile name (or use .packctl.toml in the current directory)
+        server: Option<String>,
         /// Target version (defaults to the latest)
         version: Option<String>,
         /// Print the full file-level plan
@@ -98,8 +121,8 @@ pub enum Command {
     },
     /// Apply an update
     Update {
-        /// Server profile name
-        server: String,
+        /// Server profile name (or use .packctl.toml in the current directory)
+        server: Option<String>,
         /// Target version (defaults to interactive selection)
         version: Option<String>,
         /// Do not prompt; fail if confirmation would be required
@@ -111,18 +134,18 @@ pub enum Command {
     },
     /// Roll back to the previous successful version
     Rollback {
-        /// Server profile name
-        server: String,
+        /// Server profile name (or use .packctl.toml in the current directory)
+        server: Option<String>,
     },
     /// Check a server for common problems
     Doctor {
-        /// Server profile name
-        server: String,
+        /// Server profile name (or use .packctl.toml in the current directory)
+        server: Option<String>,
     },
     /// Validate the installed server against its recorded state
     Validate {
-        /// Server profile name
-        server: String,
+        /// Server profile name (or use .packctl.toml in the current directory)
+        server: Option<String>,
     },
 }
 
@@ -134,7 +157,9 @@ pub async fn run() -> Result<()> {
             name,
             non_interactive,
             force,
+            global,
             source,
+            apikey,
             root,
             overlay,
             controller,
@@ -148,7 +173,9 @@ pub async fn run() -> Result<()> {
                 name,
                 non_interactive,
                 force,
+                global,
                 source,
+                apikey,
                 root,
                 overlay,
                 controller,
@@ -160,21 +187,34 @@ pub async fn run() -> Result<()> {
             })
             .await
         }
-        Command::Status { server } => status::run(&server).await,
-        Command::Versions { server, json } => versions::run(&server, json).await,
+        Command::Status { server } => status::run(server.as_deref()).await,
+        Command::Apikey {
+            server,
+            set,
+            remove,
+        } => apikey::run(server.as_deref(), set, remove).await,
+        Command::Versions { server, json } => versions::run(server.as_deref(), json).await,
         Command::Plan {
             server,
             version,
             verbose,
-        } => plan::run(&server, version.as_deref(), verbose).await,
+        } => plan::run(server.as_deref(), version.as_deref(), verbose).await,
         Command::Update {
             server,
             version,
             non_interactive,
             verbose,
-        } => update::run(&server, version.as_deref(), non_interactive, verbose).await,
-        Command::Rollback { server } => rollback::run(&server).await,
-        Command::Doctor { server } => doctor::run(&server).await,
-        Command::Validate { server } => validate::run(&server).await,
+        } => {
+            update::run(
+                server.as_deref(),
+                version.as_deref(),
+                non_interactive,
+                verbose,
+            )
+            .await
+        }
+        Command::Rollback { server } => rollback::run(server.as_deref()).await,
+        Command::Doctor { server } => doctor::run(server.as_deref()).await,
+        Command::Validate { server } => validate::run(server.as_deref()).await,
     }
 }

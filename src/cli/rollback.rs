@@ -9,8 +9,8 @@ use crate::core::updater::Updater;
 use crate::error::{PackError, Result};
 
 /// Restores the latest snapshot of a server profile.
-pub async fn run(server: &str) -> Result<()> {
-    let profile = crate::config::profile::load_profile(server)?;
+pub async fn run(server: Option<&str>) -> Result<()> {
+    let profile = crate::config::profile::resolve_profile(server)?;
     let updater = Updater::from_profile(&profile)?;
 
     let snapshots = list_snapshots(&profile.server.root)?;

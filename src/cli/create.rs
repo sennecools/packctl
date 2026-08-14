@@ -9,7 +9,8 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::config::profile::{
-    CommandConfig, ControllerKind, ProfileDraft, ProviderKind, write_profile,
+    CommandConfig, ControllerKind, ProfileDraft, ProviderKind, SecretsSection, write_local_profile,
+    write_profile,
 };
 use crate::error::{PackError, Result};
 use crate::providers::curseforge::client::CfClient;
@@ -22,7 +23,12 @@ pub struct CreateArgs {
     pub name: Option<String>,
     pub non_interactive: bool,
     pub force: bool,
+    /// Write the profile into the global profile directory instead of the
+    /// current directory.
+    pub global: bool,
     pub source: Option<String>,
+    /// CurseForge API key to store (encrypted) with the new profile.
+    pub apikey: Option<String>,
     pub root: Option<PathBuf>,
     pub overlay: Option<PathBuf>,
     pub controller: Option<String>,
@@ -70,7 +76,11 @@ pub async fn run(args: CreateArgs) -> Result<()> {
     let interactive = !args.non_interactive && std::io::stdin().is_terminal();
 
     let name = resolve_name(args.name.as_deref(), interactive)?;
-    let client = CfClient::from_env()?;
+    let api_key = resolve_api_key(args.apikey.clone(), interactive)?;
+    let client = match &api_key {
+        Some(key) => CfClient::with_api_key(Some(key.clone())),
+        None => CfClient::from_env()?,
+    };
     let pack = resolve_pack(&client, args.source.clone(), interactive).await?;
 
     if interactive {
@@ -94,19 +104,40 @@ pub async fn run(args: CreateArgs) -> Result<()> {
     let overlay = resolve_overlay(args.overlay.clone(), &root, interactive)?;
     let controller = select_controller(&args, &name, interactive).await?;
 
+    let secrets = match &api_key {
+        Some(key) => Some(SecretsSection {
+            api_key: Some(crate::config::secrets::encrypt_string(key.trim())?),
+        }),
+        None => None,
+    };
+
     let draft = ProfileDraft {
         name,
-        server_root: root.clone(),
+        server_root: if args.global {
+            root.clone()
+        } else {
+            relativize(&cwd, &root)
+        },
         provider: ProviderKind::CurseForge,
         project_id: pack.project_id,
         slug: (!pack.slug.is_empty()).then(|| pack.slug.clone()),
-        overlay_path: overlay.clone(),
+        overlay_path: if args.global {
+            overlay.clone()
+        } else {
+            relativize(&cwd, &overlay)
+        },
         controller: controller.kind,
         instance: controller.instance,
         command: controller.command,
+        secrets,
     };
 
-    let path = write_profile(&draft, args.force)?;
+    let path = if args.global {
+        write_profile(&draft, args.force)?
+    } else {
+        write_local_profile(&draft, args.force, &cwd)?
+    };
+
     println!();
     println!("Created profile '{}'", draft.name);
     println!("  file:       {}", path.display());
@@ -114,9 +145,43 @@ pub async fn run(args: CreateArgs) -> Result<()> {
     println!("  server:     {}", root.display());
     println!("  overlay:    {}", overlay.display());
     println!("  controller: {}", controller_description(&draft));
+    if api_key.is_some() {
+        println!("  api key:    stored (encrypted)");
+    } else {
+        println!("  api key:    not stored (set one with 'packctl apikey')");
+    }
     println!();
-    println!("Next: packctl status {}", draft.name);
+    if args.global {
+        println!("Next: packctl status {}", draft.name);
+    } else {
+        println!("Next: packctl status");
+    }
     Ok(())
+}
+
+/// Resolves the optional API key to store with the profile.
+fn resolve_api_key(flag: Option<String>, interactive: bool) -> Result<Option<String>> {
+    if let Some(key) = flag {
+        if key.trim().is_empty() {
+            return Err(PackError::Config("API key must not be empty".to_string()));
+        }
+        return Ok(Some(key));
+    }
+    if interactive {
+        let input: String = dialoguer::Input::new()
+            .with_prompt("CurseForge API key (optional, stored encrypted)")
+            .allow_empty(true)
+            .interact_text()
+            .map_err(|err| dialoguer_error("read API key", err))?;
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(trimmed.to_string()))
+        }
+    } else {
+        Ok(None)
+    }
 }
 
 /// Resolves the profile name, prompting when interactive and omitted.
@@ -251,6 +316,17 @@ fn absolute_path(path: &Path, cwd: &Path) -> PathBuf {
         path.to_path_buf()
     } else {
         cwd.join(path)
+    }
+}
+
+/// Rewrites `path` relative to `base` when it is inside it, so a config file
+/// stored next to the server root can use natural values like `"."` and
+/// `"overlay"`.
+fn relativize(base: &Path, path: &Path) -> PathBuf {
+    match path.strip_prefix(base) {
+        Ok(rel) if rel.as_os_str().is_empty() => PathBuf::from("."),
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => path.to_path_buf(),
     }
 }
 
@@ -501,6 +577,7 @@ mod tests {
             controller: ControllerKind::Amp,
             instance: Some("ATM10".to_string()),
             command: None,
+            secrets: None,
         };
         assert_eq!(controller_description(&amp), "amp (instance ATM10)");
 

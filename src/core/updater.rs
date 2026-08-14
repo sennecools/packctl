@@ -30,6 +30,7 @@ use crate::core::staging::StagingDir;
 use crate::core::state::{InstalledState, ManagedFile, StateStore};
 use crate::core::validation::{Severity, has_errors, validate};
 use crate::error::{PackError, Result};
+use crate::providers::curseforge::client::CfClient;
 use crate::providers::curseforge::installer::CurseForgeProvider;
 use crate::providers::{PackProvider, PackRef, PreparedPack, VersionSelector};
 
@@ -83,7 +84,9 @@ impl Updater {
                 profile.pack.provider
             )));
         }
-        let provider: Box<dyn PackProvider> = Box::new(CurseForgeProvider::with_env()?);
+        let provider: Box<dyn PackProvider> = Box::new(CurseForgeProvider::new(
+            CfClient::with_api_key(profile.curseforge_api_key()?),
+        ));
         let controller = crate::controllers::from_profile(&profile.controller)?;
         Ok(Updater {
             profile: profile.clone(),
@@ -523,6 +526,7 @@ mod tests {
                     timeout_ms: None,
                 }),
             },
+            secrets: crate::config::profile::SecretsSection::default(),
         }
     }
 

@@ -5,8 +5,8 @@ use crate::error::{PackError, Result};
 use crate::providers::PackVersion;
 
 /// Lists the upstream versions a server's pack can be updated to.
-pub async fn run(server: &str, json: bool) -> Result<()> {
-    let profile = crate::config::profile::load_profile(server)?;
+pub async fn run(server: Option<&str>, json: bool) -> Result<()> {
+    let profile = crate::config::profile::resolve_profile(server)?;
     let updater = Updater::from_profile(&profile)?;
 
     let versions = updater.provider.list_versions(&updater.pack_ref()).await?;

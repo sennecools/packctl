@@ -8,12 +8,12 @@ use crate::providers::VersionSelector;
 
 /// Prepares, previews, confirms, and applies an update for a server profile.
 pub async fn run(
-    server: &str,
+    server: Option<&str>,
     version: Option<&str>,
     non_interactive: bool,
     verbose: bool,
 ) -> Result<()> {
-    let profile = crate::config::profile::load_profile(server)?;
+    let profile = crate::config::profile::resolve_profile(server)?;
     let updater = Updater::from_profile(&profile)?;
 
     let selector = select_version(&updater, version, non_interactive).await?;

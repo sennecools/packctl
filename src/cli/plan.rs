@@ -8,8 +8,8 @@ use crate::error::Result;
 use crate::providers::VersionSelector;
 
 /// Prepares an update and renders the plan without mutating the server.
-pub async fn run(server: &str, version: Option<&str>, verbose: bool) -> Result<()> {
-    let profile = crate::config::profile::load_profile(server)?;
+pub async fn run(server: Option<&str>, version: Option<&str>, verbose: bool) -> Result<()> {
+    let profile = crate::config::profile::resolve_profile(server)?;
     let updater = Updater::from_profile(&profile)?;
 
     let selector = version
@@ -140,7 +140,8 @@ mod tests {
 
     use super::*;
     use crate::config::profile::{
-        ControllerKind, ControllerSection, OverlaySection, PackSection, ProviderKind, ServerSection,
+        ControllerKind, ControllerSection, OverlaySection, PackSection, ProviderKind,
+        SecretsSection, ServerSection,
     };
     use crate::core::planner::{ChangeKind, FileChange, OverlayChange, PlanNotice};
 
@@ -163,6 +164,7 @@ mod tests {
                 instance: None,
                 command: None,
             },
+            secrets: SecretsSection::default(),
         }
     }
 

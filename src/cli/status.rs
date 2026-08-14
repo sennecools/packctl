@@ -10,8 +10,8 @@ use crate::error::Result;
 ///
 /// Only reads local state and the controller's reported status; it never
 /// contacts the pack provider or mutates anything.
-pub async fn run(server: &str) -> Result<()> {
-    let profile = crate::config::profile::load_profile(server)?;
+pub async fn run(server: Option<&str>) -> Result<()> {
+    let profile = crate::config::profile::resolve_profile(server)?;
     let updater = Updater::from_profile(&profile)?;
 
     let state = updater.load_state()?;

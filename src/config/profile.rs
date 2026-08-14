@@ -66,6 +66,17 @@ pub struct ControllerSection {
     pub command: Option<CommandConfig>,
 }
 
+/// Encrypted secrets stored with a profile, such as the CurseForge API key.
+///
+/// Values are encrypted blobs produced by `config::secrets`; the master key is
+/// kept outside the profile file so the API key never sits in plaintext.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretsSection {
+    /// Encrypted CurseForge API key blob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
 /// A fully resolved server profile.
 #[derive(Debug, Clone)]
 pub struct ServerProfile {
@@ -74,6 +85,26 @@ pub struct ServerProfile {
     pub pack: PackSection,
     pub overlay: OverlaySection,
     pub controller: ControllerSection,
+    pub secrets: SecretsSection,
+}
+
+impl ServerProfile {
+    /// The CurseForge API key to use for this profile.
+    ///
+    /// `$CF_API_KEY` wins when set; otherwise the profile's stored, encrypted
+    /// key is decrypted. Returns `Ok(None)` when no key is available.
+    pub fn curseforge_api_key(&self) -> Result<Option<String>> {
+        let from_env = std::env::var("CF_API_KEY")
+            .ok()
+            .filter(|key| !key.trim().is_empty());
+        if let Some(key) = from_env {
+            return Ok(Some(key));
+        }
+        match &self.secrets.api_key {
+            Some(blob) => crate::config::secrets::decrypt_string(blob).map(Some),
+            None => Ok(None),
+        }
+    }
 }
 
 /// Raw TOML shape of a profile file, before validation and path resolution.
@@ -84,6 +115,8 @@ struct RawProfile {
     pack: RawPack,
     overlay: RawOverlay,
     controller: RawController,
+    #[serde(default)]
+    secrets: SecretsSection,
 }
 
 #[derive(Debug, Deserialize)]
@@ -201,6 +234,67 @@ pub fn list_cli() -> Result<()> {
     Ok(())
 }
 
+/// File name of a profile stored inside the server root.
+pub const LOCAL_PROFILE: &str = ".packctl.toml";
+
+/// Loads a profile for a command.
+///
+/// A named server loads the global profile `<name>.toml` from the profile
+/// directory; otherwise the local `.packctl.toml` in the current directory is
+/// used. This lets an administrator `cd` into a server root and run commands
+/// without registering anything globally.
+pub fn resolve_profile(server: Option<&str>) -> Result<ServerProfile> {
+    if let Some(name) = server {
+        return load_profile(name);
+    }
+    let cwd =
+        env::current_dir().map_err(|err| PackError::io("determine current directory", err))?;
+    resolve_local_profile_in(&cwd)
+}
+
+fn resolve_local_profile_in(cwd: &Path) -> Result<ServerProfile> {
+    load_local_profile(cwd)?.ok_or_else(|| {
+        PackError::NotFound(format!(
+            "no server name given and no {LOCAL_PROFILE} found in {}; run 'packctl create' \
+             to set up a server",
+            cwd.display()
+        ))
+    })
+}
+
+/// Loads the local profile file from `dir` (usually the current directory).
+pub fn load_local_profile(dir: &Path) -> Result<Option<ServerProfile>> {
+    let path = dir.join(LOCAL_PROFILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&path)
+        .map_err(|err| PackError::io(format!("read '{}'", path.display()), err))?;
+    let raw: RawProfile =
+        toml::from_str(&content).map_err(|err| PackError::Parse(err.to_string()))?;
+    let fallback_name = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "server".to_string());
+    raw.into_profile(&fallback_name, dir).map(Some)
+}
+
+/// Where the profile file for `server` lives.
+///
+/// A named server resolves to the global profile directory; otherwise the
+/// local file in the current directory.
+pub fn profile_file_path(server: Option<&str>) -> Result<PathBuf> {
+    match server {
+        Some(name) => Ok(profile_dir()?.join(format!("{name}.toml"))),
+        None => {
+            let cwd = env::current_dir()
+                .map_err(|err| PackError::io("determine current directory", err))?;
+            Ok(cwd.join(LOCAL_PROFILE))
+        }
+    }
+}
+
 impl RawProfile {
     fn into_profile(self, stem: &str, config_dir: &Path) -> Result<ServerProfile> {
         let name = match self.name {
@@ -227,6 +321,7 @@ impl RawProfile {
             pack,
             overlay,
             controller,
+            secrets: self.secrets,
         })
     }
 }
@@ -277,7 +372,8 @@ fn resolve_against_config(config_dir: &Path, path: &Path) -> Result<PathBuf> {
     }
 }
 
-/// A new server profile to write with [`write_profile`].
+/// A new server profile to write with [`write_profile`] or
+/// [`write_local_profile`].
 #[derive(Debug, Clone)]
 pub struct ProfileDraft {
     pub name: String,
@@ -292,6 +388,8 @@ pub struct ProfileDraft {
     pub instance: Option<String>,
     /// Command config, required when `controller` is `Command`.
     pub command: Option<CommandConfig>,
+    /// Encrypted secrets to store with the profile.
+    pub secrets: Option<SecretsSection>,
 }
 
 /// Writes a new profile `<name>.toml` into the profile directory.
@@ -316,7 +414,41 @@ pub fn write_profile(draft: &ProfileDraft, force: bool) -> Result<PathBuf> {
         PackError::io(format!("create profile directory '{}'", dir.display()), err)
     })?;
 
-    let write = ProfileWrite {
+    write_profile_at(draft, &path)
+}
+
+/// Writes a profile as `.packctl.toml` inside `dir` (the server root).
+///
+/// The config file travels with the instance, and relative paths resolve
+/// against its own directory, so `root = "."` and `overlay = "overlay"` are
+/// the natural forms here.
+pub fn write_local_profile(draft: &ProfileDraft, force: bool, dir: &Path) -> Result<PathBuf> {
+    validate_profile_name(&draft.name)?;
+
+    let path = dir.join(LOCAL_PROFILE);
+    if path.exists() && !force {
+        return Err(PackError::Config(format!(
+            "{LOCAL_PROFILE} already exists at {} (use --force to overwrite)",
+            path.display()
+        )));
+    }
+    write_profile_at(draft, &path)
+}
+
+fn write_profile_at(draft: &ProfileDraft, path: &Path) -> Result<PathBuf> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| PackError::io(format!("create '{}'", parent.display()), err))?;
+    }
+    let content = toml::to_string_pretty(&profile_write_from_draft(draft))
+        .map_err(|err| PackError::Other(format!("serialize profile: {err}")))?;
+    fs::write(path, content)
+        .map_err(|err| PackError::io(format!("write profile '{}'", path.display()), err))?;
+    Ok(path.to_path_buf())
+}
+
+fn profile_write_from_draft(draft: &ProfileDraft) -> ProfileWrite {
+    ProfileWrite {
         name: Some(draft.name.clone()),
         server: ServerWrite {
             root: draft.server_root.clone(),
@@ -334,13 +466,50 @@ pub fn write_profile(draft: &ProfileDraft, force: bool) -> Result<PathBuf> {
             instance: draft.instance.clone(),
             command: draft.command.clone(),
         },
-    };
+        secrets: draft.secrets.clone(),
+    }
+}
 
-    let content = toml::to_string_pretty(&write)
+/// Stores or removes the encrypted API key blob in an existing profile file,
+/// preserving every other field exactly as written.
+///
+/// The file is edited as TOML so relative paths and formatting choices made by
+/// [`write_local_profile`] survive.
+pub fn update_secret_in_file(path: &Path, api_key_blob: Option<&str>) -> Result<()> {
+    let content = fs::read_to_string(path)
+        .map_err(|err| PackError::io(format!("read '{}'", path.display()), err))?;
+    let mut value: toml::Value =
+        toml::from_str(&content).map_err(|err| PackError::Parse(err.to_string()))?;
+
+    match api_key_blob {
+        Some(blob) => {
+            let table = value
+                .as_table_mut()
+                .ok_or_else(|| PackError::Config("profile is not a TOML table".to_string()))?;
+            let secrets = table
+                .entry("secrets".to_string())
+                .or_insert_with(|| toml::Value::Table(Default::default()));
+            let secrets = secrets
+                .as_table_mut()
+                .ok_or_else(|| PackError::Config("profile 'secrets' is not a table".to_string()))?;
+            secrets.insert("api_key".to_string(), toml::Value::String(blob.to_string()));
+        }
+        None => {
+            if let Some(secrets) = value
+                .as_table_mut()
+                .and_then(|table| table.get_mut("secrets"))
+                .and_then(|secrets| secrets.as_table_mut())
+            {
+                secrets.remove("api_key");
+            }
+        }
+    }
+
+    let out = toml::to_string_pretty(&value)
         .map_err(|err| PackError::Other(format!("serialize profile: {err}")))?;
-    fs::write(&path, content)
+    fs::write(path, out)
         .map_err(|err| PackError::io(format!("write profile '{}'", path.display()), err))?;
-    Ok(path)
+    Ok(())
 }
 
 /// Rejects profile names that would escape the profile directory or name
@@ -365,6 +534,8 @@ struct ProfileWrite {
     pack: PackWrite,
     overlay: OverlayWrite,
     controller: ControllerWrite,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secrets: Option<SecretsSection>,
 }
 
 #[derive(Debug, Serialize)]
@@ -416,44 +587,7 @@ fn lexically_normalize(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsStr;
-    use std::sync::{LazyLock, Mutex, MutexGuard};
-
-    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    struct EnvGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &OsStr) -> Self {
-            let previous = env::var_os(key);
-            unsafe {
-                env::set_var(key, value);
-            }
-            EnvGuard { key, previous }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => unsafe {
-                    env::set_var(self.key, value);
-                },
-                None => unsafe {
-                    env::remove_var(self.key);
-                },
-            }
-        }
-    }
+    use crate::testutil::{EnvGuard, env_lock};
 
     const AMP_CONTROLLER: &str = "[controller]\ntype = \"amp\"\ninstance = \"x\"\n";
 
@@ -701,6 +835,7 @@ timeout_ms = 30000
             controller: ControllerKind::Amp,
             instance: Some("ATM10".to_string()),
             command: None,
+            secrets: None,
         };
 
         let path = write_profile(&draft, false).unwrap();
@@ -754,6 +889,7 @@ timeout_ms = 30000
                 ],
                 timeout_ms: Some(30000),
             }),
+            secrets: None,
         };
 
         write_profile(&draft, false).unwrap();
@@ -782,6 +918,7 @@ timeout_ms = 30000
             controller: ControllerKind::Amp,
             instance: Some("ATM10".to_string()),
             command: None,
+            secrets: None,
         };
 
         write_profile(&draft, false).unwrap();
@@ -811,6 +948,7 @@ timeout_ms = 30000
             controller: ControllerKind::Amp,
             instance: Some("x".to_string()),
             command: None,
+            secrets: None,
         };
 
         let err = write_profile(&draft, false).unwrap_err();
@@ -819,5 +957,130 @@ timeout_ms = 30000
             "expected Config error, got {err:?}"
         );
         assert!(!dir.path().join("..").join("escape.toml").exists());
+    }
+
+    #[test]
+    fn local_profile_writes_and_round_trips() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("PACKCTL_HOME", dir.path().as_os_str());
+
+        let draft = ProfileDraft {
+            name: "my-server".to_string(),
+            server_root: PathBuf::from("."),
+            provider: ProviderKind::CurseForge,
+            project_id: 925200,
+            slug: None,
+            overlay_path: PathBuf::from("overlay"),
+            controller: ControllerKind::Amp,
+            instance: Some("my-server".to_string()),
+            command: None,
+            secrets: None,
+        };
+
+        let path = write_local_profile(&draft, false, dir.path()).unwrap();
+        assert_eq!(path, dir.path().join(LOCAL_PROFILE));
+
+        let profile = load_local_profile(dir.path()).unwrap().unwrap();
+        assert_eq!(profile.name, "my-server");
+        assert_eq!(profile.server.root, dir.path());
+        assert_eq!(profile.overlay.path, dir.path().join("overlay"));
+        assert_eq!(profile.controller.kind, ControllerKind::Amp);
+        assert_eq!(profile.controller.instance.as_deref(), Some("my-server"));
+    }
+
+    #[test]
+    fn resolve_profile_uses_local_file_without_server_name() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("PACKCTL_HOME", dir.path().as_os_str());
+
+        fs::write(dir.path().join(LOCAL_PROFILE), base_toml(AMP_CONTROLLER)).unwrap();
+
+        let profile = resolve_local_profile_in(dir.path()).unwrap();
+        let expected = dir
+            .path()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap();
+        assert_eq!(profile.name, expected);
+        assert_eq!(profile.server.root, PathBuf::from("/srv/mc"));
+    }
+
+    #[test]
+    fn resolve_profile_errors_without_local_file_or_name() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("PACKCTL_HOME", dir.path().as_os_str());
+
+        let err = resolve_local_profile_in(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, PackError::NotFound(_)),
+            "expected NotFound error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn update_secret_in_file_preserves_and_removes() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("PACKCTL_HOME", dir.path().as_os_str());
+
+        fs::write(
+            dir.path().join(LOCAL_PROFILE),
+            "[server]\nroot = \".\"\n\n[pack]\nprovider = \"curseforge\"\nproject_id = 1\n\n[overlay]\npath = \"overlay\"\n\n[controller]\ntype = \"amp\"\ninstance = \"x\"\n",
+        )
+        .unwrap();
+
+        let path = dir.path().join(LOCAL_PROFILE);
+        update_secret_in_file(&path, Some("v1:c2VjcmV0")).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("[secrets]"), "content: {content}");
+        assert!(
+            content.contains("api_key = \"v1:c2VjcmV0\""),
+            "content: {content}"
+        );
+        assert!(content.contains("project_id = 1"), "content: {content}");
+
+        update_secret_in_file(&path, None).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("api_key"), "content: {content}");
+        assert!(content.contains("project_id = 1"), "content: {content}");
+    }
+
+    #[test]
+    fn curseforge_api_key_prefers_env_over_stored() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("PACKCTL_HOME", dir.path().as_os_str());
+
+        let draft = ProfileDraft {
+            name: "atm10".to_string(),
+            server_root: PathBuf::from("/srv/atm10"),
+            provider: ProviderKind::CurseForge,
+            project_id: 1,
+            slug: None,
+            overlay_path: PathBuf::from("/srv/atm10/overlay"),
+            controller: ControllerKind::Amp,
+            instance: Some("x".to_string()),
+            command: None,
+            secrets: Some(SecretsSection {
+                api_key: Some(crate::config::secrets::encrypt_string("stored-key").unwrap()),
+            }),
+        };
+        write_profile(&draft, false).unwrap();
+
+        let profile = load_profile("atm10").unwrap();
+        assert_eq!(
+            profile.curseforge_api_key().unwrap().as_deref(),
+            Some("stored-key")
+        );
+
+        let _key_guard = EnvGuard::set("CF_API_KEY", std::ffi::OsStr::new("env-key"));
+        assert_eq!(
+            profile.curseforge_api_key().unwrap().as_deref(),
+            Some("env-key")
+        );
     }
 }

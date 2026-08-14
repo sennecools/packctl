@@ -15,8 +15,8 @@ use crate::fs::hashing::sha256_file;
 use crate::fs::paths::safe_join;
 
 /// Validates a server against its recorded state plus the environment checks.
-pub async fn run(server: &str) -> Result<()> {
-    let profile = crate::config::profile::load_profile(server)?;
+pub async fn run(server: Option<&str>) -> Result<()> {
+    let profile = crate::config::profile::resolve_profile(server)?;
     let updater = Updater::from_profile(&profile)?;
 
     let state = updater.load_state()?;

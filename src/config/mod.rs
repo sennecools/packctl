@@ -4,3 +4,4 @@
 //! where its overlay lives, and how its process is controlled.
 
 pub mod profile;
+pub mod secrets;

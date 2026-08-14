@@ -293,6 +293,7 @@ mod tests {
                 instance: None,
                 command: None,
             },
+            secrets: crate::config::profile::SecretsSection::default(),
         }
     }
 
