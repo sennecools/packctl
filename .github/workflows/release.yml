@@ -24,22 +24,20 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Native toolchain
+      - name: Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build x86_64
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo build --release --target x86_64-unknown-linux-gnu
-
-      - name: Build aarch64 (cross)
+      - name: Install aarch64 cross toolchain
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        uses: cross-rs/cross-action@v0
-        with:
-          target: aarch64-unknown-linux-gnu
-          command: build
-          args: --release
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
       - name: Stage archive
         run: |
