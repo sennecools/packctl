@@ -185,6 +185,21 @@ pub fn list_profiles() -> Result<Vec<ServerProfile>> {
     Ok(profiles)
 }
 
+/// Prints the configured server profiles for `packctl list`.
+pub fn list_cli() -> Result<()> {
+    let profiles = list_profiles()?;
+    if profiles.is_empty() {
+        println!("No server profiles configured.");
+        println!("Create a profile in {}", profile_dir()?.display());
+        return Ok(());
+    }
+    println!("Server profiles");
+    for profile in &profiles {
+        println!("  {}", profile.name);
+    }
+    Ok(())
+}
+
 impl RawProfile {
     fn into_profile(self, stem: &str, config_dir: &Path) -> Result<ServerProfile> {
         let name = match self.name {
