@@ -24,3 +24,17 @@ pub trait ServerController: Send + Sync {
     async fn stop(&self) -> Result<()>;
     async fn start(&self) -> Result<()>;
 }
+
+/// Builds the controller described by a profile's `[controller]` section.
+pub fn from_profile(
+    controller: &crate::config::profile::ControllerSection,
+) -> Result<Box<dyn ServerController>> {
+    match controller.kind {
+        crate::config::profile::ControllerKind::Amp => {
+            Ok(Box::new(amp::AmpController::from_profile(controller)?))
+        }
+        crate::config::profile::ControllerKind::Command => {
+            Ok(Box::new(command::CommandController::from_profile(controller)?))
+        }
+    }
+}
