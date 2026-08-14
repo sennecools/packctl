@@ -78,6 +78,14 @@ pub struct CfFileListResponse {
     pub pagination: CfPagination,
 }
 
+/// Envelope returned by `GET /v1/mods/search`.
+#[derive(Debug, Deserialize)]
+pub struct CfModSearchResponse {
+    pub data: Vec<CfMod>,
+    #[serde(default)]
+    pub pagination: CfPagination,
+}
+
 /// Pagination metadata for a file list page.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -224,6 +232,23 @@ mod tests {
         assert_eq!(parsed.pagination.total_count, 0);
         assert_eq!(parsed.pagination.index, 0);
         assert_eq!(parsed.pagination.page_size, 0);
+    }
+
+    #[test]
+    fn search_response_parses() {
+        let json = r#"
+        {
+            "data": [
+                {"id": 925200, "name": "All the Mods 10", "slug": "all-the-mods-10"}
+            ],
+            "pagination": {"index": 0, "pageSize": 50, "totalCount": 1}
+        }
+        "#;
+        let parsed: CfModSearchResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.data.len(), 1);
+        assert_eq!(parsed.data[0].id, 925200);
+        assert_eq!(parsed.data[0].slug, "all-the-mods-10");
+        assert_eq!(parsed.pagination.total_count, 1);
     }
 
     #[test]

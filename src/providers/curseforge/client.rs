@@ -13,7 +13,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::error::{PackError, Result};
 
-use super::models::{CfFile, CfFileListResponse, CfMod};
+use super::models::{CfFile, CfFileListResponse, CfMod, CfModSearchResponse};
 
 const DEFAULT_BASE_URL: &str = "https://api.curseforge.com";
 const API_KEY_HEADER: &str = "x-api-key";
@@ -22,6 +22,8 @@ const PAGE_SIZE: u64 = 50;
 const MAX_PAGES: u32 = 200;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Game id for Minecraft.
+const GAME_ID_MINECRAFT: u32 = 432;
 
 /// HTTP client for the CurseForge API.
 pub struct CfClient {
@@ -124,6 +126,31 @@ impl CfClient {
             .map_err(|e| PackError::Parse(format!("failed to parse file payload from {url}: {e}")))
     }
 
+    /// Fetches the first Minecraft project whose slug matches `slug`.
+    ///
+    /// The CurseForge search endpoint filters by slug; public reads work
+    /// without an API key.
+    pub async fn search_by_slug(&self, slug: &str) -> Result<CfMod> {
+        let url = self.search_endpoint();
+        let response = self
+            .http
+            .get(&url)
+            .query(&[
+                ("gameId", GAME_ID_MINECRAFT.to_string()),
+                ("slug", slug.to_string()),
+            ])
+            .send()
+            .await
+            .map_err(|e| PackError::Network(format!("failed to fetch {url}: {e}")))?;
+        let response = self.ensure_success(response, &url).await?;
+        let payload: CfModSearchResponse = response.json().await.map_err(|e| {
+            PackError::Parse(format!("failed to parse search payload from {url}: {e}"))
+        })?;
+        payload.data.into_iter().next().ok_or_else(|| {
+            PackError::NotFound(format!("no CurseForge project found for slug '{slug}'"))
+        })
+    }
+
     /// Streams `url` to `dest`, creating parent directories as needed.
     pub async fn download_to(&self, url: &str, dest: &Path) -> Result<()> {
         if let Some(parent) = dest.parent()
@@ -178,6 +205,11 @@ impl CfClient {
             PAGE_SIZE,
             index
         )
+    }
+
+    /// Base URL of the mod search endpoint.
+    pub(crate) fn search_endpoint(&self) -> String {
+        format!("{}/v1/mods/search", self.base_url)
     }
 
     async fn ensure_success(
@@ -262,6 +294,15 @@ mod tests {
         assert_eq!(
             client.files_page_url(925200, 50),
             "https://api.curseforge.com/v1/mods/925200/files?pageSize=50&index=50"
+        );
+    }
+
+    #[test]
+    fn search_endpoint_is_mod_search() {
+        let client = test_client();
+        assert_eq!(
+            client.search_endpoint(),
+            "https://api.curseforge.com/v1/mods/search"
         );
     }
 

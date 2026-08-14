@@ -1,6 +1,9 @@
 /target
 
 
+# Local working memory (not part of the repo)
+/memory.md
+
 # Added by cargo
 #
 # already existing elements were commented out

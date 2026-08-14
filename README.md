@@ -66,6 +66,16 @@ VERSION=v0.1.0 INSTALL_DIR=$HOME/bin \
   curl -fsSL https://raw.githubusercontent.com/sennecools/packctl/main/install.sh | sh
 ```
 
+Every commit to `main` is built automatically and published to a `rolling`
+prerelease. To install the very latest commit build:
+
+```bash
+VERSION=rolling \
+  curl -fsSL https://raw.githubusercontent.com/sennecools/packctl/main/install.sh | sh
+```
+
+Stable tagged releases remain the default (`latest`).
+
 Or build from source with a Rust toolchain:
 
 ```bash
@@ -74,17 +84,62 @@ cargo build --release
 sudo install -m 0755 target/release/packctl /usr/local/bin/packctl
 ```
 
-The CurseForge API key is optional — public API reads work without one. If you run into rate limits, export it:
+The CurseForge API key is read from the environment only and never written to logs or state. It is needed to resolve a modpack URL or slug (for example when creating a profile from a URL); pass a numeric project id to skip it:
 
 ```bash
 export CF_API_KEY="..."
 ```
 
-The key is read from the environment only and never written to logs or state.
-
 ## Configuration
 
-Each server is one TOML profile. Create `<name>.toml` (for example `atm10.toml`) in the profile directory, which is resolved in this order:
+Each server is one TOML profile. The easiest way to create one is:
+
+```bash
+cd /srv/AlltheMods10
+packctl create atm10
+```
+
+`packctl create` asks for the CurseForge modpack (a URL like
+`https://www.curseforge.com/minecraft/modpacks/all-the-mods-10`, a numeric
+project id, or a slug), the server root, the overlay directory, and how the
+server process is controlled, then writes the profile. You can `cd` into a
+directory and accept the defaults to get a working profile:
+
+```text
+Server profile name [AlltheMods10]: atm10
+CurseForge modpack URL or project ID: https://www.curseforge.com/minecraft/modpacks/all-the-mods-10
+Found 'All the Mods 10' (project 925200)? [Y/n] y
+Server root [/srv/AlltheMods10]:
+Overlay directory [/srv/AlltheMods10/overlay]:
+Server controller: amp
+AMP instance name [atm10]: ATM10
+
+Created profile 'atm10'
+  file:       ~/.config/packctl/atm10.toml
+  pack:       All the Mods 10 (project 925200)
+  server:     /srv/AlltheMods10
+  overlay:    /srv/AlltheMods10/overlay
+  controller: amp (instance ATM10)
+
+Next: packctl status atm10
+```
+
+Resolving a URL or slug looks the project up through the CurseForge API, which
+needs the `CF_API_KEY` environment variable. A numeric project id works without
+a key. Every value can be supplied as a flag instead of a prompt for
+scripting, e.g.:
+
+```bash
+packctl create atm10 --source 925200 \
+  --root /srv/AlltheMods10 \
+  --controller command \
+  --status "pgrep -f server.jar" \
+  --stop "screen -S atm10 -X stuff \"stop\n\"" \
+  --start "screen -S atm10 -X stuff \"start\n\""
+```
+
+If you prefer to write the file by hand, create `<name>.toml` in the profile
+directory, which is resolved in this order:
 
 1. `$PACKCTL_HOME` if set
 2. `$XDG_CONFIG_HOME/packctl`, or `~/.config/packctl` by default
@@ -164,6 +219,7 @@ Everything else under the server root is treated as updater-managed content.
 | Command | Description |
 | --- | --- |
 | `packctl list` | List configured server profiles. |
+| `packctl create <server> [--source <url\|id\|slug>] [--root <path>] ...` | Interactively create a new server profile. `--non-interactive`/`-n` requires every value as a flag; `--force`/`-f` overwrites an existing profile. |
 | `packctl status <server>` | Show installed version, last update, managed-file count, snapshot count, and controller status. Local only, no network. |
 | `packctl versions <server> [--json]` | List available upstream versions. `-j`/`--json` prints an array of `{id, name, released}`. |
 | `packctl plan <server> [version] [--verbose]` | Preview an update without changing anything. `-v`/`--verbose` lists every file. |

@@ -9,19 +9,19 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{PackError, Result};
 
 /// Pack provider for a profile's upstream pack.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
     CurseForge,
 }
 
 /// Kind of server controller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ControllerKind {
     Amp,
@@ -29,11 +29,12 @@ pub enum ControllerKind {
 }
 
 /// Command controller configuration, used when the controller kind is `command`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandConfig {
     pub status: Vec<String>,
     pub stop: Vec<String>,
     pub start: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
 }
 
@@ -274,6 +275,124 @@ fn resolve_against_config(config_dir: &Path, path: &Path) -> Result<PathBuf> {
             env::current_dir().map_err(|err| PackError::io("determine current directory", err))?;
         Ok(cwd.join(normalized))
     }
+}
+
+/// A new server profile to write with [`write_profile`].
+#[derive(Debug, Clone)]
+pub struct ProfileDraft {
+    pub name: String,
+    pub server_root: PathBuf,
+    pub provider: ProviderKind,
+    pub project_id: u32,
+    /// Human-friendly pack identifier; written only when non-empty.
+    pub slug: Option<String>,
+    pub overlay_path: PathBuf,
+    pub controller: ControllerKind,
+    /// AMP instance name, required when `controller` is `Amp`.
+    pub instance: Option<String>,
+    /// Command config, required when `controller` is `Command`.
+    pub command: Option<CommandConfig>,
+}
+
+/// Writes a new profile `<name>.toml` into the profile directory.
+///
+/// Errors when the profile already exists unless `force` is set. Paths are
+/// written as given; callers should write absolute paths so the profile does
+/// not depend on where it is loaded from. Returns the written path.
+pub fn write_profile(draft: &ProfileDraft, force: bool) -> Result<PathBuf> {
+    validate_profile_name(&draft.name)?;
+
+    let dir = profile_dir()?;
+    let path = dir.join(format!("{}.toml", draft.name));
+    if path.exists() && !force {
+        return Err(PackError::Config(format!(
+            "profile '{}' already exists at {} (use --force to overwrite)",
+            draft.name,
+            path.display()
+        )));
+    }
+
+    fs::create_dir_all(&dir).map_err(|err| {
+        PackError::io(format!("create profile directory '{}'", dir.display()), err)
+    })?;
+
+    let write = ProfileWrite {
+        name: Some(draft.name.clone()),
+        server: ServerWrite {
+            root: draft.server_root.clone(),
+        },
+        pack: PackWrite {
+            provider: draft.provider,
+            project_id: draft.project_id,
+            slug: draft.slug.clone(),
+        },
+        overlay: OverlayWrite {
+            path: draft.overlay_path.clone(),
+        },
+        controller: ControllerWrite {
+            kind: draft.controller,
+            instance: draft.instance.clone(),
+            command: draft.command.clone(),
+        },
+    };
+
+    let content = toml::to_string_pretty(&write)
+        .map_err(|err| PackError::Other(format!("serialize profile: {err}")))?;
+    fs::write(&path, content)
+        .map_err(|err| PackError::io(format!("write profile '{}'", path.display()), err))?;
+    Ok(path)
+}
+
+/// Rejects profile names that would escape the profile directory or name
+/// another file.
+fn validate_profile_name(name: &str) -> Result<()> {
+    let invalid =
+        name.trim().is_empty() || name == "." || name == ".." || name.contains(['/', '\\']);
+    if invalid {
+        return Err(PackError::Config(format!(
+            "invalid profile name '{name}': must be a single path segment"
+        )));
+    }
+    Ok(())
+}
+
+/// Serialization shape of a profile file. Mirrors the raw deserialization
+/// shape so everything [`write_profile`] writes is readable again.
+#[derive(Debug, Serialize)]
+struct ProfileWrite {
+    name: Option<String>,
+    server: ServerWrite,
+    pack: PackWrite,
+    overlay: OverlayWrite,
+    controller: ControllerWrite,
+}
+
+#[derive(Debug, Serialize)]
+struct ServerWrite {
+    root: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct PackWrite {
+    provider: ProviderKind,
+    project_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slug: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OverlayWrite {
+    path: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct ControllerWrite {
+    #[serde(rename = "type")]
+    kind: ControllerKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<CommandConfig>,
 }
 
 /// Remove `.` components and resolve `..` components lexically, without
@@ -564,5 +683,141 @@ timeout_ms = 30000
         assert_eq!(command.stop.join(" "), "screen -S mc -X stuff stop\n");
         assert_eq!(command.start.join(" "), "systemctl start mc");
         assert_eq!(command.timeout_ms, Some(30000));
+    }
+
+    #[test]
+    fn write_profile_round_trips_amp() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("PACKCTL_HOME", dir.path().as_os_str());
+
+        let draft = ProfileDraft {
+            name: "atm10".to_string(),
+            server_root: PathBuf::from("/srv/atm10"),
+            provider: ProviderKind::CurseForge,
+            project_id: 925200,
+            slug: Some("all-the-mods-10".to_string()),
+            overlay_path: PathBuf::from("/srv/atm10/overlay"),
+            controller: ControllerKind::Amp,
+            instance: Some("ATM10".to_string()),
+            command: None,
+        };
+
+        let path = write_profile(&draft, false).unwrap();
+        assert_eq!(path, dir.path().join("atm10.toml"));
+
+        let profile = load_profile("atm10").unwrap();
+        assert_eq!(profile.name, "atm10");
+        assert_eq!(profile.server.root, PathBuf::from("/srv/atm10"));
+        assert_eq!(profile.pack.provider, ProviderKind::CurseForge);
+        assert_eq!(profile.pack.project_id, 925200);
+        assert_eq!(profile.pack.slug.as_deref(), Some("all-the-mods-10"));
+        assert_eq!(profile.overlay.path, PathBuf::from("/srv/atm10/overlay"));
+        assert_eq!(profile.controller.kind, ControllerKind::Amp);
+        assert_eq!(profile.controller.instance.as_deref(), Some("ATM10"));
+        assert!(profile.controller.command.is_none());
+    }
+
+    #[test]
+    fn write_profile_round_trips_command() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("PACKCTL_HOME", dir.path().as_os_str());
+
+        let draft = ProfileDraft {
+            name: "mc".to_string(),
+            server_root: PathBuf::from("/srv/mc"),
+            provider: ProviderKind::CurseForge,
+            project_id: 1,
+            slug: None,
+            overlay_path: PathBuf::from("/srv/mc/overlay"),
+            controller: ControllerKind::Command,
+            instance: None,
+            command: Some(CommandConfig {
+                status: vec![
+                    "pgrep".to_string(),
+                    "-f".to_string(),
+                    "server.jar".to_string(),
+                ],
+                stop: vec![
+                    "screen".to_string(),
+                    "-S".to_string(),
+                    "mc".to_string(),
+                    "-X".to_string(),
+                    "stuff".to_string(),
+                    "stop\n".to_string(),
+                ],
+                start: vec![
+                    "systemctl".to_string(),
+                    "start".to_string(),
+                    "mc".to_string(),
+                ],
+                timeout_ms: Some(30000),
+            }),
+        };
+
+        write_profile(&draft, false).unwrap();
+
+        let profile = load_profile("mc").unwrap();
+        let command = profile.controller.command.as_ref().unwrap();
+        assert_eq!(command.status.join(" "), "pgrep -f server.jar");
+        assert_eq!(command.stop.join(" "), "screen -S mc -X stuff stop\n");
+        assert_eq!(command.start.join(" "), "systemctl start mc");
+        assert_eq!(command.timeout_ms, Some(30000));
+    }
+
+    #[test]
+    fn write_profile_refuses_overwrite_without_force() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("PACKCTL_HOME", dir.path().as_os_str());
+
+        let draft = ProfileDraft {
+            name: "atm10".to_string(),
+            server_root: PathBuf::from("/srv/atm10"),
+            provider: ProviderKind::CurseForge,
+            project_id: 1,
+            slug: None,
+            overlay_path: PathBuf::from("/srv/atm10/overlay"),
+            controller: ControllerKind::Amp,
+            instance: Some("ATM10".to_string()),
+            command: None,
+        };
+
+        write_profile(&draft, false).unwrap();
+
+        let err = write_profile(&draft, false).unwrap_err();
+        assert!(
+            matches!(err, PackError::Config(_)),
+            "expected Config error, got {err:?}"
+        );
+
+        write_profile(&draft, true).unwrap();
+    }
+
+    #[test]
+    fn write_profile_rejects_unsafe_names() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("PACKCTL_HOME", dir.path().as_os_str());
+
+        let draft = ProfileDraft {
+            name: "../escape".to_string(),
+            server_root: PathBuf::from("/srv"),
+            provider: ProviderKind::CurseForge,
+            project_id: 1,
+            slug: None,
+            overlay_path: PathBuf::from("/srv/overlay"),
+            controller: ControllerKind::Amp,
+            instance: Some("x".to_string()),
+            command: None,
+        };
+
+        let err = write_profile(&draft, false).unwrap_err();
+        assert!(
+            matches!(err, PackError::Config(_)),
+            "expected Config error, got {err:?}"
+        );
+        assert!(!dir.path().join("..").join("escape.toml").exists());
     }
 }
