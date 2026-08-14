@@ -1,0 +1,87 @@
+# packctl server profile for an ATM10 server.
+#
+# Install: copy this file to <name>.toml in the profile directory and edit the
+# paths to match your host. The profile directory is $PACKCTL_HOME if set,
+# otherwise $XDG_CONFIG_HOME/packctl (default ~/.config/packctl).
+#
+# Commands then use the profile name:
+#   packctl status atm10
+#   packctl plan atm10
+#   packctl update atm10
+
+# Display name. Optional; if omitted, the file name (minus .toml) is used.
+name = "atm10"
+
+# ---------------------------------------------------------------------------
+# [server] — where the live Minecraft server lives on disk.
+#
+# root: the server root directory (the deployment target). It does not need to
+#       exist yet, but commands that inspect/update the server need it to.
+#       Relative paths are resolved against the directory containing this file.
+# ---------------------------------------------------------------------------
+[server]
+root = "/home/amp/.ampdata/instances/ATM10/Minecraft"
+
+# ---------------------------------------------------------------------------
+# [pack] — which upstream modpack this server follows.
+#
+# provider:   the pack provider. V1 supports only "curseforge".
+# project_id: the provider's project identifier (a number). The ATM10
+#             CurseForge project id is 925200.
+# slug:       optional human-friendly identifier for this pack.
+# ---------------------------------------------------------------------------
+[pack]
+provider = "curseforge"
+project_id = 925200
+slug = "atm10"
+
+# ---------------------------------------------------------------------------
+# [overlay] — your local mirrored overlay.
+#
+# path: a directory whose structure mirrors the server root. Files here are
+#       copied over the upstream installation after every update and always
+#       win over upstream content. Relative paths resolve against the
+#       directory containing this file.
+#
+# Put your admin/grief-logging mods, custom config, KubeJS changes, and any
+# managed server.properties here, e.g.:
+#
+#   /srv/packctl/overlay/mods/grieflogger.jar
+#   /srv/packctl/overlay/config/MiniMOTD/main.conf
+#   /srv/packctl/overlay/server.properties
+# ---------------------------------------------------------------------------
+[overlay]
+path = "/srv/packctl/overlay"
+
+# ---------------------------------------------------------------------------
+# [controller] — how packctl stops/start/checks the server process.
+#
+# Two kinds are supported. This file uses the generic command controller.
+# Each command is an argv array (never run through a shell); the optional
+# timeout_ms bounds every invocation and lifecycle confirmation poll
+# (default 120000).
+# ---------------------------------------------------------------------------
+[controller]
+type = "command"
+
+# status: exit 0 = running, exit 1 = stopped, anything else = unknown.
+# stop/start: must exit 0 on success. Adjust for your process manager
+# (systemd, screen, tmux, ...). These are placeholders -- edit them.
+[controller.command]
+status = ["pgrep", "-f", "ATM10/server.jar"]
+stop = ["screen", "-S", "atm10", "-X", "stuff", "stop\n"]
+start = ["screen", "-S", "atm10", "-X", "stuff", "start\n"]
+timeout_ms = 120000
+
+# ---------------------------------------------------------------------------
+# Alternative: CubeCoders AMP controller.
+#
+# If the server runs under CubeCoders AMP, comment out the [controller] and
+# [controller.command] sections above and uncomment the block below. AMP is
+# driven through the `ampinstmgr` CLI; `instance` must match the instance
+# name configured in AMP.
+#
+# [controller]
+# type = "amp"
+# instance = "ATM10"
+# ---------------------------------------------------------------------------
