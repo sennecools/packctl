@@ -9,7 +9,8 @@ set -eu
 #   INSTALL_DIR=$HOME/bin curl -fsSL ... | sh
 #
 # Overridable via environment:
-#   VERSION       release tag to install (default: latest)
+#   VERSION       release tag to install (default: latest; "rolling" installs
+#                 the latest continuous build from main)
 #   INSTALL_DIR   directory to install into (default: /usr/local/bin as root,
 #                 else $HOME/.local/bin)
 
@@ -92,4 +93,4 @@ chmod 0755 "$INSTALL_DIR/packctl"
 
 say "installed $VERSION to $INSTALL_DIR/packctl"
 "$INSTALL_DIR/packctl" --version
-say "next: create a server profile in ~/.config/packctl/ (see examples/atm10.toml)"
+say "next: run 'packctl create' to set up a server profile"
