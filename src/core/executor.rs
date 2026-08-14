@@ -9,10 +9,6 @@
 //! modifications. The mirrored overlay is applied afterwards by the
 //! [`OverlayEngine`], so overlay content always wins over upstream content.
 //!
-// The public API in this module is consumed by the CLI modules, which are not
-// implemented yet. Allow dead_code so the ready API surface does not emit
-// warnings while the rest of the core is being built out.
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 

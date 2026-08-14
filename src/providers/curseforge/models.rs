@@ -4,8 +4,6 @@
 //! and default optional fields to empty values so partial payloads still
 //! parse. JSON field names are camelCase; Rust field names are snake_case.
 
-#![allow(dead_code)]
-
 use serde::Deserialize;
 
 /// A CurseForge mod. A modpack is a mod whose files are modpack versions.

@@ -6,7 +6,7 @@
 
 pub mod curseforge;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::Result;
 
@@ -76,9 +76,5 @@ pub trait PackProvider {
         pack: &PackRef,
         selector: &VersionSelector,
     ) -> Result<ResolvedPackVersion>;
-    async fn prepare(
-        &self,
-        version: &ResolvedPackVersion,
-        staging: &PathBuf,
-    ) -> Result<PreparedPack>;
+    async fn prepare(&self, version: &ResolvedPackVersion, staging: &Path) -> Result<PreparedPack>;
 }

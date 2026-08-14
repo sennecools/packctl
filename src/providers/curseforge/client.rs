@@ -3,8 +3,6 @@
 //! The API key is stored only inside this client and is sent as the
 //! `x-api-key` header on every request. It is never logged or exposed.
 
-#![allow(dead_code)]
-
 use std::path::Path;
 use std::time::Duration;
 

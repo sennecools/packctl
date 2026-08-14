@@ -4,10 +4,6 @@
 //! arbitrary server data. State lives at `<server_root>/.packctl/state.json`.
 //! See design notes "State Store".
 //!
-// The public API in this module is consumed by the planner/executor modules,
-// which are not implemented yet. Allow dead_code so the ready API surface does
-// not emit warnings while the rest of the core is being built out.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -13,10 +13,6 @@
 //! [`UpdatePlan`] shared with `packctl plan`. Execution (`execute`) is the
 //! single place that stops the server and mutates managed files.
 //!
-// The public API in this module is consumed by the CLI modules, which are not
-// implemented yet. Allow dead_code so the ready API surface does not emit
-// warnings while the rest of the core is being built out.
-#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -39,17 +35,16 @@ use crate::providers::{PackProvider, PackRef, PreparedPack, VersionSelector};
 
 /// Everything needed to run a single planned update.
 pub struct PreparedUpdate {
-    pub state: InstalledState,
     pub overlay_files: Vec<OverlayFile>,
     pub plan: UpdatePlan,
     pub prepared: PreparedPack,
+    /// Held so the staged sources remain valid for the duration of execution.
     pub staging: StagingDir,
 }
 
 /// The result of executing an update.
 #[derive(Debug)]
 pub struct UpdateOutcome {
-    pub plan: UpdatePlan,
     pub upstream_writes: usize,
     pub overlay_copied: usize,
     pub snapshot: Option<Snapshot>,
@@ -129,7 +124,6 @@ impl Updater {
             &overlay_files,
         )?;
         Ok(PreparedUpdate {
-            state,
             overlay_files,
             plan,
             prepared,
@@ -152,7 +146,6 @@ impl Updater {
 
         if plan.is_empty() {
             return Ok(UpdateOutcome {
-                plan,
                 upstream_writes: 0,
                 overlay_copied: 0,
                 snapshot: None,
@@ -212,7 +205,6 @@ impl Updater {
         StateStore::at(server_root)?.save(&new_state)?;
 
         Ok(UpdateOutcome {
-            plan,
             upstream_writes,
             overlay_copied,
             snapshot: Some(snapshot),
@@ -221,11 +213,16 @@ impl Updater {
     }
 }
 
+/// Relative path of the state file inside the server root.
+const STATE_REL_PATH: &str = ".packctl/state.json";
+
 /// Creates the rollback snapshot covering every path the plan touches.
 ///
 /// Only paths that already exist on disk are copied into the snapshot; planned
 /// additions that do not exist yet are still recorded as tracked so a rollback
-/// can remove them again.
+/// can remove them again. The pre-update `state.json` is included so a
+/// rollback can also restore the previous state metadata (design notes "Rollback",
+/// step "Restore state metadata").
 fn snapshot_before_mutation(plan: &UpdatePlan, server_root: &Path) -> Result<Snapshot> {
     let mut tracked: Vec<PathBuf> = plan
         .additions
@@ -239,6 +236,7 @@ fn snapshot_before_mutation(plan: &UpdatePlan, server_root: &Path) -> Result<Sna
             .iter()
             .map(|change| change.rel_path.clone()),
     );
+    tracked.push(PathBuf::from(STATE_REL_PATH));
 
     let tracked_strs: Vec<String> = tracked.iter().map(|rel| rel_key(rel)).collect();
 
@@ -438,7 +436,7 @@ mod tests {
         async fn prepare(
             &self,
             version: &ResolvedPackVersion,
-            staging: &PathBuf,
+            staging: &Path,
         ) -> Result<PreparedPack> {
             let server_root = staging.join("server");
             std::fs::create_dir_all(server_root.join("mods")).unwrap();
@@ -488,7 +486,7 @@ mod tests {
         async fn prepare(
             &self,
             version: &ResolvedPackVersion,
-            staging: &PathBuf,
+            staging: &Path,
         ) -> Result<PreparedPack> {
             let server_root = staging.join("server");
             std::fs::create_dir_all(&server_root).unwrap();

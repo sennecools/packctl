@@ -7,8 +7,6 @@
 //! (case-insensitive). If no server pack can be found, preparation fails with
 //! an actionable `PackError::Provider`.
 
-#![allow(dead_code)]
-
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -71,11 +69,7 @@ impl PackProvider for CurseForgeProvider {
         })
     }
 
-    async fn prepare(
-        &self,
-        version: &ResolvedPackVersion,
-        staging: &PathBuf,
-    ) -> Result<PreparedPack> {
+    async fn prepare(&self, version: &ResolvedPackVersion, staging: &Path) -> Result<PreparedPack> {
         let project_id = version.pack.project_id;
 
         tokio::fs::create_dir_all(staging).await.map_err(|e| {

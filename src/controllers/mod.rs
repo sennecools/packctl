@@ -33,8 +33,8 @@ pub fn from_profile(
         crate::config::profile::ControllerKind::Amp => {
             Ok(Box::new(amp::AmpController::from_profile(controller)?))
         }
-        crate::config::profile::ControllerKind::Command => {
-            Ok(Box::new(command::CommandController::from_profile(controller)?))
-        }
+        crate::config::profile::ControllerKind::Command => Ok(Box::new(
+            command::CommandController::from_profile(controller)?,
+        )),
     }
 }

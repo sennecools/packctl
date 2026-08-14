@@ -6,10 +6,6 @@
 //! preparation succeeds, the planner builds the update plan from the staged
 //! content and the executor applies it to the live server.
 //!
-// The public API in this module is consumed by the planner/executor modules,
-// which are not implemented yet. Allow dead_code so the ready API surface does
-// not emit warnings while the rest of the core is being built out.
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
