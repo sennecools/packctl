@@ -225,7 +225,9 @@ impl CfClient {
         body.truncate(256);
         let reason = match status {
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                "authentication failed; check the CF_API_KEY".to_string()
+                "authentication failed; set CF_API_KEY (get a free key at \
+                 https://console.curseforge.com/)"
+                    .to_string()
             }
             StatusCode::NOT_FOUND => "resource not found".to_string(),
             StatusCode::TOO_MANY_REQUESTS => "rate limited; retry later".to_string(),

@@ -84,11 +84,17 @@ cargo build --release
 sudo install -m 0755 target/release/packctl /usr/local/bin/packctl
 ```
 
-The CurseForge API key is read from the environment only and never written to logs or state. It is needed to resolve a modpack URL or slug (for example when creating a profile from a URL); pass a numeric project id to skip it:
+The CurseForge API requires a free API key. `packctl` reads it from the
+`CF_API_KEY` environment variable and never writes it to logs or state. Get one
+(one-time, free) at <https://console.curseforge.com/>:
 
 ```bash
 export CF_API_KEY="..."
 ```
+
+Without a key, the network commands (`versions`, `plan`, `update`) fail with a
+message explaining where to get one. Creating a profile from a numeric project
+id still works without a key.
 
 ## Configuration
 
