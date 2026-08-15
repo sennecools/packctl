@@ -76,32 +76,22 @@ impl CommandController {
     /// binary, permissions) and timeouts are errors; the caller maps the exit
     /// code.
     async fn run_command(&self, argv: &[String], what: &str) -> Result<Output> {
-        let Some(program) = argv.first() else {
+        if argv.is_empty() {
             return Err(PackError::Controller(format!(
                 "{what} command is empty; check the profile's [controller.command] section"
             )));
-        };
+        }
 
         let timeout = Duration::from_millis(self.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
 
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.args(&argv[1..]);
-        cmd.kill_on_drop(true);
-
-        match tokio::time::timeout(timeout, cmd.output()).await {
-            Err(_elapsed) => Err(PackError::Controller(format!(
-                "{what} command timed out after {} ms: {}",
-                timeout.as_millis(),
-                argv.join(" ")
-            ))),
-            Ok(Err(err)) => Err(PackError::Controller(format!(
-                "{what} command could not be run: {}: {err}\n\
-                 ensure the binary exists and is executable (check the profile's \
-                 [controller.command] section)",
-                argv.join(" ")
-            ))),
-            Ok(Ok(output)) => Ok(output),
-        }
+        crate::controllers::run_argv_bounded(
+            argv,
+            timeout,
+            what,
+            "ensure the binary exists and is executable (check the profile's \
+             [controller.command] section)",
+        )
+        .await
     }
 
     /// Wait for `status()` to report `target`, polling every ~1s up to the
@@ -191,7 +181,13 @@ mod tests {
     fn write_script(dir: &Path, name: &str, body: &str) -> String {
         let path = dir.join(name);
         let tmp = dir.join(format!(".{name}.tmp"));
-        fs::write(&tmp, format!("#!/bin/sh\n{body}\n")).unwrap();
+        {
+            use std::io::Write as _;
+            let mut file = fs::File::create(&tmp).unwrap();
+            file.write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+                .unwrap();
+            file.sync_all().unwrap();
+        }
         fs::rename(&tmp, &path).unwrap();
         let mut perms = fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);

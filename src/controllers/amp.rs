@@ -115,23 +115,13 @@ impl AmpController {
 
     /// Run `argv` without a shell, bounded by `timeout_ms`.
     async fn run_command(&self, argv: &[String], what: &str) -> Result<Output> {
-        let mut cmd = tokio::process::Command::new(&argv[0]);
-        cmd.args(&argv[1..]);
-        cmd.kill_on_drop(true);
-
-        match tokio::time::timeout(Duration::from_millis(self.timeout_ms), cmd.output()).await {
-            Err(_elapsed) => Err(PackError::Controller(format!(
-                "{what} command timed out after {} ms: {}",
-                self.timeout_ms,
-                argv.join(" ")
-            ))),
-            Ok(Err(err)) => Err(PackError::Controller(format!(
-                "{what} command could not be run: {}: {err}\n\
-                 ensure the ampinstmgr binary exists and is executable",
-                argv.join(" ")
-            ))),
-            Ok(Ok(output)) => Ok(output),
-        }
+        crate::controllers::run_argv_bounded(
+            argv,
+            Duration::from_millis(self.timeout_ms),
+            what,
+            "ensure the ampinstmgr binary exists and is executable",
+        )
+        .await
     }
 
     /// Wait for `status()` to report `target`, polling every ~1s up to
@@ -246,7 +236,13 @@ mod tests {
     fn write_executable(dir: &Path, name: &str, body: &str) -> String {
         let path = dir.join(name);
         let tmp = dir.join(format!(".{name}.tmp"));
-        fs::write(&tmp, format!("#!/bin/sh\n{body}\n")).unwrap();
+        {
+            use std::io::Write as _;
+            let mut file = fs::File::create(&tmp).unwrap();
+            file.write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+                .unwrap();
+            file.sync_all().unwrap();
+        }
         fs::rename(&tmp, &path).unwrap();
         let mut perms = fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
