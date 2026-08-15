@@ -1,7 +1,7 @@
 //! HTTP client for the CurseForge API (api.curseforge.com, v1).
 //!
 //! The API key is stored only inside this client and is sent as the
-//! `x-api-key` header on every request. It is never logged or exposed.
+//! `x-api-key` header on CurseForge API requests. It is never logged or exposed.
 
 use std::path::Path;
 use std::time::Duration;
@@ -9,6 +9,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Client, ClientBuilder, StatusCode};
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::error::{PackError, Result};
@@ -27,7 +28,8 @@ const GAME_ID_MINECRAFT: u32 = 432;
 
 /// HTTP client for the CurseForge API.
 pub struct CfClient {
-    http: Client,
+    api_http: Client,
+    download_http: Client,
     api_key: Option<String>,
     base_url: String,
     /// Bound on concurrent downloads issued through this client.
@@ -47,15 +49,24 @@ impl CfClient {
 
     /// Builds a client with an explicit API key (useful for tests).
     pub fn with_api_key(api_key: Option<String>) -> Self {
-        let http = ClientBuilder::new()
+        let api_http = ClientBuilder::new()
             .user_agent(USER_AGENT)
             .timeout(REQUEST_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
             .default_headers(request_headers(&api_key))
             .build()
             .expect("reqwest client construction cannot fail with the configured defaults");
+        // Download URLs are CDN URLs, not CurseForge API endpoints. Never attach API credentials.
+        let download_http = ClientBuilder::new()
+            .user_agent(USER_AGENT)
+            .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .default_headers(download_headers())
+            .build()
+            .expect("reqwest client construction cannot fail with the configured defaults");
         Self {
-            http,
+            api_http,
+            download_http,
             api_key,
             base_url: DEFAULT_BASE_URL.to_string(),
             max_concurrent_downloads: 4,
@@ -71,7 +82,7 @@ impl CfClient {
     pub async fn get_mod(&self, project_id: u32) -> Result<CfMod> {
         let url = self.mod_url(project_id);
         let response = self
-            .http
+            .api_http
             .get(&url)
             .send()
             .await
@@ -90,7 +101,7 @@ impl CfClient {
         for _page in 0..MAX_PAGES {
             let url = self.files_page_url(project_id, index);
             let response = self
-                .http
+                .api_http
                 .get(&url)
                 .send()
                 .await
@@ -114,7 +125,7 @@ impl CfClient {
     pub async fn get_file(&self, project_id: u32, file_id: u32) -> Result<CfFile> {
         let url = self.file_url(project_id, file_id);
         let response = self
-            .http
+            .api_http
             .get(&url)
             .send()
             .await
@@ -133,7 +144,7 @@ impl CfClient {
     pub async fn search_by_slug(&self, slug: &str) -> Result<CfMod> {
         let url = self.search_endpoint();
         let response = self
-            .http
+            .api_http
             .get(&url)
             .query(&[
                 ("gameId", GAME_ID_MINECRAFT.to_string()),
@@ -151,8 +162,23 @@ impl CfClient {
         })
     }
 
-    /// Streams `url` to `dest`, creating parent directories as needed.
-    pub async fn download_to(&self, url: &str, dest: &Path) -> Result<()> {
+    /// Downloads a CurseForge file and verifies its published size and SHA-256.
+    ///
+    /// A sibling partial file is removed on failure; the final destination is
+    /// only replaced after all bytes have been verified.
+    pub async fn download_file_to(&self, file: &CfFile, dest: &Path) -> Result<()> {
+        let url = file.download_url.as_deref().ok_or_else(|| {
+            PackError::Provider(format!("CurseForge file {} has no download URL", file.id))
+        })?;
+        let expected_sha256 = file.sha256_hash().ok_or_else(|| {
+            PackError::Provider(format!("CurseForge file {} has no SHA-256 hash", file.id))
+        })?;
+        if !is_sha256(expected_sha256) {
+            return Err(PackError::Provider(format!(
+                "CurseForge file {} has an invalid SHA-256 hash",
+                file.id
+            )));
+        }
         if let Some(parent) = dest.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -160,27 +186,54 @@ impl CfClient {
                 PackError::io(format!("create directory '{}'", parent.display()), e)
             })?;
         }
-        let response =
-            self.http.get(url).send().await.map_err(|e| {
+        let partial = dest.with_extension("partial");
+        remove_partial(&partial).await?;
+
+        let result = async {
+            let response = self.download_http.get(url).send().await.map_err(|e| {
                 PackError::Network(format!("failed to start download from {url}: {e}"))
             })?;
-        let response = self.ensure_success(response, url).await?;
+            let response = self.ensure_success(response, url).await?;
 
-        let mut stream = response.bytes_stream();
-        let mut file = tokio::fs::File::create(dest)
-            .await
-            .map_err(|e| PackError::io(format!("create '{}'", dest.display()), e))?;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| {
-                PackError::Network(format!("download from {url} was interrupted: {e}"))
-            })?;
-            file.write_all(&chunk)
+            let mut stream = response.bytes_stream();
+            let mut output = tokio::fs::File::create(&partial)
                 .await
-                .map_err(|e| PackError::io(format!("write '{}'", dest.display()), e))?;
+                .map_err(|e| PackError::io(format!("create '{}'", partial.display()), e))?;
+            let mut size = 0u64;
+            let mut hasher = Sha256::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| {
+                    PackError::Network(format!("download from {url} was interrupted: {e}"))
+                })?;
+                size = size.checked_add(chunk.len() as u64).ok_or_else(|| {
+                    PackError::Provider(format!("download from {url} exceeds supported size"))
+                })?;
+                hasher.update(&chunk);
+                output
+                    .write_all(&chunk)
+                    .await
+                    .map_err(|e| PackError::io(format!("write '{}'", partial.display()), e))?;
+            }
+            output
+                .flush()
+                .await
+                .map_err(|e| PackError::io(format!("flush '{}'", partial.display()), e))?;
+            let actual_sha256 = format!("{:x}", hasher.finalize());
+            verify_download_metadata(file, size, &actual_sha256)?;
+            tokio::fs::rename(&partial, dest).await.map_err(|e| {
+                PackError::io(format!("move verified download to '{}'", dest.display()), e)
+            })
         }
-        file.flush()
-            .await
-            .map_err(|e| PackError::io(format!("flush '{}'", dest.display()), e))?;
+        .await;
+        if let Err(download_error) = result {
+            if let Err(cleanup_error) = remove_partial(&partial).await {
+                return Err(PackError::Provider(format!(
+                    "{download_error}; also failed to remove partial download '{}': {cleanup_error}",
+                    partial.display()
+                )));
+            }
+            return Err(download_error);
+        }
         Ok(())
     }
 
@@ -253,6 +306,44 @@ fn request_headers(api_key: &Option<String>) -> HeaderMap {
         headers.insert(API_KEY_HEADER, value);
     }
     headers
+}
+
+fn download_headers() -> HeaderMap {
+    HeaderMap::new()
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn verify_download_metadata(file: &CfFile, actual_size: u64, actual_sha256: &str) -> Result<()> {
+    if actual_size != file.file_length {
+        return Err(PackError::Provider(format!(
+            "downloaded CurseForge file {} has size {actual_size}, expected {}",
+            file.id, file.file_length
+        )));
+    }
+    let expected_sha256 = file.sha256_hash().ok_or_else(|| {
+        PackError::Provider(format!("CurseForge file {} has no SHA-256 hash", file.id))
+    })?;
+    if !expected_sha256.eq_ignore_ascii_case(actual_sha256) {
+        return Err(PackError::Provider(format!(
+            "downloaded CurseForge file {} failed SHA-256 verification",
+            file.id
+        )));
+    }
+    Ok(())
+}
+
+async fn remove_partial(path: &Path) -> Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(PackError::io(
+            format!("remove partial download '{}'", path.display()),
+            e,
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -329,6 +420,49 @@ mod tests {
         assert_eq!(
             headers.get(API_KEY_HEADER).and_then(|v| v.to_str().ok()),
             Some("spaced-key")
+        );
+    }
+
+    #[test]
+    fn download_headers_never_include_api_key() {
+        assert!(download_headers().get(API_KEY_HEADER).is_none());
+    }
+
+    #[test]
+    fn verify_download_metadata_rejects_size_or_hash_mismatch() {
+        let file = CfFile {
+            id: 1,
+            display_name: String::new(),
+            file_name: "pack.zip".to_string(),
+            file_date: String::new(),
+            file_length: 3,
+            download_url: Some("https://downloads.example/pack.zip".to_string()),
+            release_type: 1,
+            file_hashes: vec![super::super::models::CfFileHash {
+                value: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                    .to_string(),
+                algo_id: 3,
+            }],
+            game_versions: Vec::new(),
+            is_server_pack: false,
+            server_pack_file_id: None,
+        };
+        assert!(
+            verify_download_metadata(
+                &file,
+                2,
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            )
+            .is_err()
+        );
+        assert!(verify_download_metadata(&file, 3, "00").is_err());
+        assert!(
+            verify_download_metadata(
+                &file,
+                3,
+                "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"
+            )
+            .is_ok()
         );
     }
 

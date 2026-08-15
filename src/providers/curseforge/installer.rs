@@ -1,11 +1,7 @@
 //! CurseForge `PackProvider` implementation.
 //!
-//! V1 design decision: version resolution operates on the client modpack files
-//! for a pack, but the download used for an update is the mod's server pack
-//! (`serverPackFileId`). When `serverPackFileId` is absent we fall back to
-//! searching the file list for a file whose `fileName` contains "serverpack"
-//! (case-insensitive). If no server pack can be found, preparation fails with
-//! an actionable `PackError::Provider`.
+//! A client pack version is selectable only when its own CurseForge file
+//! metadata names a paired server pack via `serverPackFileId`.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,7 +12,7 @@ use crate::error::{PackError, Result};
 use crate::fs::hashing::sha256_file;
 use crate::fs::paths::{normalize_relative, safe_join};
 use crate::providers::curseforge::client::CfClient;
-use crate::providers::curseforge::models::{CfFile, CfMod};
+use crate::providers::curseforge::models::CfFile;
 use crate::providers::{
     PackProvider, PackRef, PackVersion, PreparedFile, PreparedPack, ResolvedPackVersion,
     VersionSelector,
@@ -41,7 +37,7 @@ impl CurseForgeProvider {
 impl PackProvider for CurseForgeProvider {
     async fn list_versions(&self, pack: &PackRef) -> Result<Vec<PackVersion>> {
         let mut files = self.client.get_files(pack.project_id).await?;
-        files.retain(|file| !file.is_server_pack_name());
+        files.retain(is_selectable_client_file);
         sort_files_newest_first(&mut files);
         Ok(files.iter().map(version_from_file).collect())
     }
@@ -79,33 +75,24 @@ impl PackProvider for CurseForgeProvider {
             )
         })?;
 
-        let mod_info = self.client.get_mod(project_id).await?;
-        let files = self.client.get_files(project_id).await?;
-
-        let server_file_id = pick_server_pack(&mod_info, &files).ok_or_else(|| {
+        let client_file_id = version.version.file_id.ok_or_else(|| {
             PackError::Provider(format!(
-                "cannot find a server pack for '{}' (project {project_id}): the mod has no \
-                 serverPackFileId and none of its files is named like a server pack",
-                mod_info.name
+                "resolved version '{}' for project {project_id} has no CurseForge file id",
+                version.version.name
+            ))
+        })?;
+        let client_file = self.client.get_file(project_id, client_file_id).await?;
+        let server_file_id = client_file.server_pack_file_id.ok_or_else(|| {
+            PackError::Provider(format!(
+                "resolved version '{}' (file {client_file_id}) for project {project_id} has no paired server pack",
+                version.version.name
             ))
         })?;
 
         let server_file = self.client.get_file(project_id, server_file_id).await?;
-        let download_url = server_file.download_url.clone().ok_or_else(|| {
-            PackError::Provider(format!(
-                "server pack file {server_file_id} of '{}' has no download URL",
-                mod_info.name
-            ))
-        })?;
-
-        let slug = if mod_info.slug.is_empty() {
-            version.pack.slug.clone()
-        } else {
-            mod_info.slug.clone()
-        };
-        let archive_path = staging.join(format!("{slug}-server-pack.zip"));
+        let archive_path = staging.join("curseforge-server-pack.zip");
         self.client
-            .download_to(&download_url, &archive_path)
+            .download_file_to(&server_file, &archive_path)
             .await?;
 
         let server_root = staging.join("server");
@@ -116,7 +103,7 @@ impl PackProvider for CurseForgeProvider {
             .map_err(spawn_error)??;
 
         Ok(PreparedPack {
-            name: mod_info.name,
+            name: version.pack.slug.clone(),
             version: version.version.clone(),
             root: server_root,
             files,
@@ -143,6 +130,10 @@ pub(crate) fn version_from_file(file: &CfFile) -> PackVersion {
         file_id: Some(file.id),
         released,
     }
+}
+
+fn is_selectable_client_file(file: &CfFile) -> bool {
+    !file.is_server_pack && file.server_pack_file_id.is_some()
 }
 
 /// Sorts files newest first: releases (1) before betas (2) before alphas (3),
@@ -173,20 +164,6 @@ pub(crate) fn resolve_version_from_list<'a>(
     }
 }
 
-/// Picks the server pack file id for a mod.
-///
-/// Prefers the mod's `serverPackFileId`; otherwise falls back to the first file
-/// whose name looks like a server pack.
-pub(crate) fn pick_server_pack(mod_info: &CfMod, files: &[CfFile]) -> Option<u32> {
-    if let Some(file_id) = mod_info.server_pack_file_id {
-        return Some(file_id);
-    }
-    files
-        .iter()
-        .find(|file| file.is_server_pack_name())
-        .map(|file| file.id)
-}
-
 /// Extracts a server pack zip into `dest_root`, enforcing strict path safety.
 ///
 /// Absolute paths, `..` components, `.`/empty components, NUL bytes, backslash
@@ -206,7 +183,9 @@ pub(crate) fn extract_server_pack(zip_path: &Path, dest_root: &Path) -> Result<V
         PackError::Parse(format!("invalid zip archive '{}': {e}", zip_path.display()))
     })?;
 
+    validate_archive(&mut archive, zip_path)?;
     let mut dest_paths = Vec::new();
+    let mut total_uncompressed = 0u64;
 
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(|e| {
@@ -216,9 +195,6 @@ pub(crate) fn extract_server_pack(zip_path: &Path, dest_root: &Path) -> Result<V
             ))
         })?;
 
-        if is_symlink_entry(&entry) {
-            return Err(PackError::UnsafePath(PathBuf::from(entry.name())));
-        }
         if entry.is_dir() {
             continue;
         }
@@ -234,12 +210,26 @@ pub(crate) fn extract_server_pack(zip_path: &Path, dest_root: &Path) -> Result<V
         let mut out = std::fs::File::create(&dest)
             .map_err(|e| PackError::io(format!("create '{}'", dest.display()), e))?;
         let mut buffer = [0u8; 64 * 1024];
+        let mut entry_uncompressed = 0u64;
         loop {
             let read = entry
                 .read(&mut buffer)
                 .map_err(|e| PackError::io(format!("read zip entry '{name}'"), e))?;
             if read == 0 {
                 break;
+            }
+            entry_uncompressed = entry_uncompressed
+                .checked_add(read as u64)
+                .ok_or_else(|| PackError::Provider("zip entry size overflow".to_string()))?;
+            total_uncompressed = total_uncompressed
+                .checked_add(read as u64)
+                .ok_or_else(|| PackError::Provider("zip total size overflow".to_string()))?;
+            if entry_uncompressed > MAX_ENTRY_UNCOMPRESSED_BYTES
+                || total_uncompressed > MAX_TOTAL_UNCOMPRESSED_BYTES
+            {
+                return Err(PackError::Provider(
+                    "zip archive exceeds extraction size limits".to_string(),
+                ));
             }
             out.write_all(&buffer[..read])
                 .map_err(|e| PackError::io(format!("write '{}'", dest.display()), e))?;
@@ -266,6 +256,59 @@ pub(crate) fn extract_server_pack(zip_path: &Path, dest_root: &Path) -> Result<V
         });
     }
     Ok(prepared)
+}
+
+const MAX_ZIP_ENTRIES: usize = 10_000;
+const MAX_TOTAL_UNCOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_ENTRY_UNCOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn validate_archive(archive: &mut zip::ZipArchive<std::fs::File>, zip_path: &Path) -> Result<()> {
+    if archive.len() > MAX_ZIP_ENTRIES {
+        return Err(PackError::Provider(format!(
+            "zip archive '{}' has {} entries; limit is {MAX_ZIP_ENTRIES}",
+            zip_path.display(),
+            archive.len()
+        )));
+    }
+    let mut total_uncompressed = 0u64;
+    let mut paths = std::collections::HashSet::with_capacity(archive.len());
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|e| {
+            PackError::Parse(format!(
+                "read entry {index} from '{}': {e}",
+                zip_path.display()
+            ))
+        })?;
+        if is_symlink_entry(&entry) {
+            return Err(PackError::UnsafePath(PathBuf::from(entry.name())));
+        }
+        let rel = normalize_relative(Path::new(entry.name()))?;
+        if !paths.insert(rel) {
+            return Err(PackError::Provider(format!(
+                "zip archive '{}' contains a duplicate path '{}'",
+                zip_path.display(),
+                entry.name()
+            )));
+        }
+        if !entry.is_dir() {
+            if entry.size() > MAX_ENTRY_UNCOMPRESSED_BYTES {
+                return Err(PackError::Provider(format!(
+                    "zip archive '{}' contains an entry larger than {MAX_ENTRY_UNCOMPRESSED_BYTES} bytes",
+                    zip_path.display()
+                )));
+            }
+            total_uncompressed = total_uncompressed
+                .checked_add(entry.size())
+                .ok_or_else(|| PackError::Provider("zip total size overflow".to_string()))?;
+            if total_uncompressed > MAX_TOTAL_UNCOMPRESSED_BYTES {
+                return Err(PackError::Provider(format!(
+                    "zip archive '{}' exceeds the {MAX_TOTAL_UNCOMPRESSED_BYTES}-byte extraction limit",
+                    zip_path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 const S_IFMT: u32 = 0o170000;
@@ -309,6 +352,8 @@ mod tests {
             release_type,
             file_hashes: Vec::new(),
             game_versions: Vec::new(),
+            is_server_pack: false,
+            server_pack_file_id: None,
         }
     }
 
@@ -433,6 +478,40 @@ mod tests {
     }
 
     #[test]
+    fn extract_server_pack_rejects_duplicate_normalized_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("duplicate.zip");
+        write_zip(
+            &zip_path,
+            &[("mods/a.jar", b"one"), ("mods\\a.jar", b"two")],
+        );
+
+        let result = extract_server_pack(&zip_path, &dir.path().join("server"));
+        assert!(
+            matches!(result, Err(PackError::Provider(message)) if message.contains("duplicate path"))
+        );
+    }
+
+    #[test]
+    fn extract_server_pack_rejects_too_many_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("many.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        for index in 0..=MAX_ZIP_ENTRIES {
+            writer
+                .start_file(format!("files/{index}"), SimpleFileOptions::default())
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let result = extract_server_pack(&zip_path, &dir.path().join("server"));
+        assert!(
+            matches!(result, Err(PackError::Provider(message)) if message.contains("entries; limit"))
+        );
+    }
+
+    #[test]
     fn version_from_file_uses_display_name_or_file_stem() {
         let with_display = make_file(
             10,
@@ -520,41 +599,20 @@ mod tests {
     }
 
     #[test]
-    fn pick_server_pack_prefers_server_pack_file_id() {
-        let mod_info = CfMod {
-            id: 925200,
-            name: "ATM10".to_string(),
-            slug: "all-the-mods-10".to_string(),
+    fn only_client_files_with_an_explicit_server_mapping_are_selectable() {
+        let unpaired = make_file(1, "client", "ATM10-2.41.zip", 1, "");
+        let paired = CfFile {
             server_pack_file_id: Some(99),
+            ..make_file(2, "client", "ATM10-2.42.zip", 1, "")
         };
-        let files = vec![make_file(1, "client", "ATM10-2.41.zip", 1, "")];
-        assert_eq!(pick_server_pack(&mod_info, &files), Some(99));
-    }
+        let server = CfFile {
+            is_server_pack: true,
+            server_pack_file_id: Some(100),
+            ..make_file(99, "server", "ServerPack-2.42.zip", 1, "")
+        };
 
-    #[test]
-    fn pick_server_pack_falls_back_to_named_file() {
-        let mod_info = CfMod {
-            id: 925200,
-            name: "ATM10".to_string(),
-            slug: "all-the-mods-10".to_string(),
-            server_pack_file_id: None,
-        };
-        let files = vec![
-            make_file(1, "client", "ATM10-2.41.zip", 1, ""),
-            make_file(2, "server pack", "ServerPack-2.41.zip", 1, ""),
-        ];
-        assert_eq!(pick_server_pack(&mod_info, &files), Some(2));
-    }
-
-    #[test]
-    fn pick_server_pack_none_when_no_server_pack() {
-        let mod_info = CfMod {
-            id: 925200,
-            name: "ATM10".to_string(),
-            slug: "all-the-mods-10".to_string(),
-            server_pack_file_id: None,
-        };
-        let files = vec![make_file(1, "client", "ATM10-2.41.zip", 1, "")];
-        assert_eq!(pick_server_pack(&mod_info, &files), None);
+        assert!(!is_selectable_client_file(&unpaired));
+        assert!(is_selectable_client_file(&paired));
+        assert!(!is_selectable_client_file(&server));
     }
 }

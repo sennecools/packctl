@@ -42,6 +42,12 @@ pub struct CfFile {
     pub file_hashes: Vec<CfFileHash>,
     #[serde(default)]
     pub game_versions: Vec<String>,
+    /// Whether this file is itself a server pack rather than a client pack version.
+    #[serde(default)]
+    pub is_server_pack: bool,
+    /// File id of the server pack paired with this client pack version.
+    #[serde(default)]
+    pub server_pack_file_id: Option<u32>,
 }
 
 impl CfFile {
@@ -51,14 +57,6 @@ impl CfFile {
             .iter()
             .find(|hash| hash.algo_id == 3)
             .map(|hash| hash.value.as_str())
-    }
-
-    /// True when the file name looks like a dedicated server pack.
-    ///
-    /// CurseForge server packs are typically named like
-    /// `ServerPack-1.2.3.zip`; the check is case-insensitive.
-    pub fn is_server_pack_name(&self) -> bool {
-        self.file_name.to_lowercase().contains("serverpack")
     }
 }
 
@@ -149,6 +147,8 @@ mod tests {
             "downloadUrl": "https://edge.forgecdn.net/files/1234/5678/ATM10-2.41.zip",
             "isAlternate": false,
             "gameVersions": ["1.21.1", "Fabric"],
+            "isServerPack": false,
+            "serverPackFileId": 54321,
             "fileHashes": [
                 {"value": "d41d8cd98f00b204e9800998ecf8427e", "algoId": 1},
                 {"value": "da39a3ee5e6b4b0d3255bfef95601890afd80709", "algoId": 2},
@@ -168,11 +168,13 @@ mod tests {
             Some("https://edge.forgecdn.net/files/1234/5678/ATM10-2.41.zip")
         );
         assert_eq!(parsed.game_versions, vec!["1.21.1", "Fabric"]);
+        assert!(!parsed.is_server_pack);
+        assert_eq!(parsed.server_pack_file_id, Some(54321));
         assert_eq!(
             parsed.sha256_hash(),
             Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
         );
-        assert!(!parsed.is_server_pack_name());
+        assert!(!parsed.is_server_pack);
     }
 
     #[test]
@@ -187,6 +189,8 @@ mod tests {
         assert_eq!(parsed.release_type, 0);
         assert!(parsed.file_hashes.is_empty());
         assert!(parsed.game_versions.is_empty());
+        assert!(!parsed.is_server_pack);
+        assert_eq!(parsed.server_pack_file_id, None);
         assert_eq!(parsed.sha256_hash(), None);
     }
 
@@ -252,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn is_server_pack_name_detects_server_packs() {
+    fn cf_file_parses_server_pack_marker() {
         let server = CfFile {
             id: 1,
             display_name: String::new(),
@@ -263,8 +267,10 @@ mod tests {
             release_type: 1,
             file_hashes: Vec::new(),
             game_versions: Vec::new(),
+            is_server_pack: true,
+            server_pack_file_id: None,
         };
-        assert!(server.is_server_pack_name());
+        assert!(server.is_server_pack);
 
         let client = CfFile {
             id: 2,
@@ -276,7 +282,9 @@ mod tests {
             release_type: 1,
             file_hashes: Vec::new(),
             game_versions: Vec::new(),
+            is_server_pack: false,
+            server_pack_file_id: None,
         };
-        assert!(!client.is_server_pack_name());
+        assert!(!client.is_server_pack);
     }
 }
