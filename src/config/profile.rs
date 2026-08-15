@@ -6,7 +6,7 @@
 
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -147,8 +147,8 @@ struct RawController {
 /// Resolve the directory that contains `<name>.toml` profile files.
 ///
 /// Priority: `$PACKCTL_HOME` if set; else `$XDG_CONFIG_HOME/packctl` (default
-/// `$HOME/.config/packctl`) when the config directory exists or a home
-/// directory is available; else `./packctl`.
+/// `$HOME/.config/packctl`) when a home directory is available; else
+/// `./packctl`.
 pub fn profile_dir() -> Result<PathBuf> {
     if let Some(dir) = env::var_os("PACKCTL_HOME") {
         return Ok(PathBuf::from(dir));
@@ -157,19 +157,15 @@ pub fn profile_dir() -> Result<PathBuf> {
     let xdg_config = env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     let home = env::var_os("HOME").map(PathBuf::from);
 
-    let candidate = xdg_config.map(|base| base.join("packctl")).or_else(|| {
-        home.as_ref()
-            .map(|home| home.join(".config").join("packctl"))
-    });
-
-    match candidate {
-        Some(dir) if dir.exists() || home.is_some() => Ok(dir),
-        _ => Ok(PathBuf::from("./packctl")),
-    }
+    Ok(xdg_config
+        .map(|base| base.join("packctl"))
+        .or_else(|| home.map(|home| home.join(".config").join("packctl")))
+        .unwrap_or_else(|| PathBuf::from("./packctl")))
 }
 
 /// Load and fully resolve the profile with the given name.
 pub fn load_profile(name: &str) -> Result<ServerProfile> {
+    validate_profile_name(name)?;
     let dir = profile_dir()?;
     let path = dir.join(format!("{name}.toml"));
 
@@ -286,7 +282,10 @@ pub fn load_local_profile(dir: &Path) -> Result<Option<ServerProfile>> {
 /// local file in the current directory.
 pub fn profile_file_path(server: Option<&str>) -> Result<PathBuf> {
     match server {
-        Some(name) => Ok(profile_dir()?.join(format!("{name}.toml"))),
+        Some(name) => {
+            validate_profile_name(name)?;
+            Ok(profile_dir()?.join(format!("{name}.toml")))
+        }
         None => {
             let cwd = env::current_dir()
                 .map_err(|err| PackError::io("determine current directory", err))?;
@@ -442,8 +441,7 @@ fn write_profile_at(draft: &ProfileDraft, path: &Path) -> Result<PathBuf> {
     }
     let content = toml::to_string_pretty(&profile_write_from_draft(draft))
         .map_err(|err| PackError::Other(format!("serialize profile: {err}")))?;
-    fs::write(path, content)
-        .map_err(|err| PackError::io(format!("write profile '{}'", path.display()), err))?;
+    atomic_write(path, content.as_bytes())?;
     Ok(path.to_path_buf())
 }
 
@@ -507,9 +505,74 @@ pub fn update_secret_in_file(path: &Path, api_key_blob: Option<&str>) -> Result<
 
     let out = toml::to_string_pretty(&value)
         .map_err(|err| PackError::Other(format!("serialize profile: {err}")))?;
-    fs::write(path, out)
-        .map_err(|err| PackError::io(format!("write profile '{}'", path.display()), err))?;
+    atomic_write(path, out.as_bytes())?;
     Ok(())
+}
+
+/// Replace a file only after its complete new contents have been written to a
+/// temporary sibling. Renaming within one directory is atomic on supported
+/// filesystems, so readers see either complete version of a profile.
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        PackError::Config(format!(
+            "profile path '{}' has no parent directory",
+            path.display()
+        ))
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        PackError::Config(format!(
+            "profile path '{}' has no file name",
+            path.display()
+        ))
+    })?;
+
+    for attempt in 0..100 {
+        let temporary = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            attempt
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(mut file) => {
+                let write_result = (|| -> io::Result<()> {
+                    file.write_all(contents)?;
+                    file.sync_all()
+                })();
+                if let Err(err) = write_result {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(PackError::io(
+                        format!("write profile '{}'", path.display()),
+                        err,
+                    ));
+                }
+                if let Err(err) = fs::rename(&temporary, path) {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(PackError::io(
+                        format!("replace profile '{}'", path.display()),
+                        err,
+                    ));
+                }
+                return Ok(());
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(PackError::io(
+                    format!("create temporary profile for '{}'", path.display()),
+                    err,
+                ));
+            }
+        }
+    }
+
+    Err(PackError::Other(format!(
+        "could not allocate a temporary file to update profile '{}'",
+        path.display()
+    )))
 }
 
 /// Rejects profile names that would escape the profile directory or name
@@ -717,6 +780,47 @@ instance = "ATM10"
                 );
             }
             other => panic!("expected NotFound error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_profile_routes_reject_unsafe_names() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("PACKCTL_HOME", dir.path().as_os_str());
+
+        for name in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "nested/profile",
+            r"nested\profile",
+        ] {
+            let load_error = load_profile(name).unwrap_err();
+            assert!(matches!(load_error, PackError::Config(_)), "name: {name}");
+
+            let path_error = profile_file_path(Some(name)).unwrap_err();
+            assert!(matches!(path_error, PackError::Config(_)), "name: {name}");
+        }
+    }
+
+    #[test]
+    fn xdg_config_home_is_used_even_before_directory_exists() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let xdg = dir.path().join("xdg-does-not-exist");
+        let _xdg_guard = EnvGuard::set("XDG_CONFIG_HOME", xdg.as_os_str());
+        let _home_guard = EnvGuard::set("HOME", dir.path().as_os_str());
+        let previous_packctl_home = env::var_os("PACKCTL_HOME");
+        // PACKCTL_HOME is inherited by other tests, so explicitly remove it.
+        unsafe { env::remove_var("PACKCTL_HOME") };
+
+        assert_eq!(profile_dir().unwrap(), xdg.join("packctl"));
+
+        match previous_packctl_home {
+            Some(value) => unsafe { env::set_var("PACKCTL_HOME", value) },
+            None => unsafe { env::remove_var("PACKCTL_HOME") },
         }
     }
 
@@ -1047,6 +1151,18 @@ timeout_ms = 30000
         let content = fs::read_to_string(&path).unwrap();
         assert!(!content.contains("api_key"), "content: {content}");
         assert!(content.contains("project_id = 1"), "content: {content}");
+    }
+
+    #[test]
+    fn profile_updates_leave_no_partial_or_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile.toml");
+        fs::write(&path, "old").unwrap();
+
+        atomic_write(&path, b"new complete profile").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new complete profile");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

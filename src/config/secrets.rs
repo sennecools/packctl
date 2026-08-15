@@ -10,8 +10,11 @@
 //! access as the same user or root, who can read the master key itself.
 
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::Path;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -37,8 +40,17 @@ pub fn load_or_create_master_key() -> Result<[u8; KEY_LEN]> {
         Ok(bytes) => bytes_as_key(bytes, &path),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             let key = random_bytes(KEY_LEN)?;
-            write_key_file(&path, &key)?;
-            Ok(bytes_as_key(key, &path)?)
+            match write_key_file(&path, &key) {
+                Ok(()) => bytes_as_key(key, &path),
+                // Another process won the race. Use its key so both processes
+                // encrypt secrets that can be decrypted subsequently.
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => fs::read(&path)
+                    .map_err(|err| {
+                        PackError::io(format!("read master key '{}'", path.display()), err)
+                    })
+                    .and_then(|bytes| bytes_as_key(bytes, &path)),
+                Err(err) => Err(PackError::io(format!("write '{}'", path.display()), err)),
+            }
         }
         Err(err) => Err(PackError::io(
             format!("read master key '{}'", path.display()),
@@ -122,21 +134,76 @@ fn bytes_as_key(bytes: Vec<u8>, path: &Path) -> Result<[u8; KEY_LEN]> {
     })
 }
 
-fn write_key_file(path: &Path, key: &[u8]) -> Result<()> {
+fn write_key_file(path: &Path, key: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| PackError::io(format!("create '{}'", parent.display()), err))?;
+        fs::create_dir_all(parent)?;
     }
-    fs::write(path, key)
-        .map_err(|err| PackError::io(format!("write '{}'", path.display()), err))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|err| {
-            PackError::io(format!("set permissions on '{}'", path.display()), err)
-        })?;
+        write_key_file_unix(path, key)
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        file.write_all(key)?;
+        file.sync_all()?;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn write_key_file_unix(path: &Path, key: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "master key path has no parent directory",
+        )
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "master key path has no file name",
+        )
+    })?;
+    for attempt in 0..100 {
+        let temporary = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            attempt
+        ));
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        };
+        // Set the exact requested mode while this process exclusively owns the
+        // temporary file; umask may otherwise make it more restrictive.
+        let result = (|| -> io::Result<()> {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file.write_all(key)?;
+            file.sync_all()?;
+            // Linking is an atomic create: either this complete key wins, or a
+            // concurrent creator has already published its own key.
+            fs::hard_link(&temporary, path)
+        })();
+        let _ = fs::remove_file(&temporary);
+        return result;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate temporary master key file",
+    ))
 }
 
 /// Fills `len` bytes from the kernel CSPRNG.
@@ -186,6 +253,21 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn exclusive_key_creation_preserves_existing_key() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("PACKCTL_HOME", dir.path().as_os_str());
+        let path = key_file_path().unwrap();
+        let existing = [0x42; KEY_LEN];
+
+        write_key_file(&path, &existing).unwrap();
+        let error = write_key_file(&path, &[0x24; KEY_LEN]).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(path).unwrap(), existing);
     }
 
     #[test]
