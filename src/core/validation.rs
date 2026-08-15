@@ -189,7 +189,7 @@ fn check_disk_space(root: &Path, prepared: &PreparedPack, issues: &mut Vec<Valid
     }
 }
 
-/// Returns the free space in 1K blocks on the filesystem containing `root`.
+/// Returns the free space in bytes on the filesystem containing `root`.
 fn free_space(root: &Path) -> Option<u64> {
     let output = std::process::Command::new("df")
         .arg("-P")
@@ -199,7 +199,7 @@ fn free_space(root: &Path) -> Option<u64> {
     if !output.status.success() {
         return None;
     }
-    parse_df_available(&String::from_utf8_lossy(&output.stdout))
+    parse_df_available(&String::from_utf8_lossy(&output.stdout))?.checked_mul(1024)
 }
 
 fn bytes_to_mib(bytes: u64) -> u64 {
@@ -369,6 +369,11 @@ mod tests {
             None
         );
         assert_eq!(parse_df_available("garbage without numbers\n"), None);
+    }
+
+    #[test]
+    fn df_blocks_are_converted_to_bytes() {
+        assert_eq!(bytes_to_mib(524_288 * 1024), 512);
     }
 
     #[tokio::test]

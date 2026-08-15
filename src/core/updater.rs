@@ -121,10 +121,11 @@ impl Updater {
         let staging = StagingDir::create_default()?;
         let prepared = self.provider.prepare(&resolved, &staging.root).await?;
         let overlay_files = OverlayEngine::new(self.profile.overlay.path.clone()).scan()?;
-        let plan = UpdatePlanner::new(FilePolicy::default_policy()).build_plan(
+        let plan = UpdatePlanner::new(FilePolicy::default_policy()).build_plan_for_server(
             &state,
             &prepared,
             &overlay_files,
+            &self.profile.server.root,
         )?;
         Ok(PreparedUpdate {
             overlay_files,
@@ -156,6 +157,21 @@ impl Updater {
             });
         }
 
+        // Hold the lock through preflight and commit so no concurrent rollback
+        // or update can act on the same server state.
+        let _lock = StateStore::at(server_root)?.lock()?;
+
+        let issues = validate(
+            &self.profile,
+            Some(&prepared.prepared),
+            &prepared.overlay_files,
+            self.controller.as_ref(),
+        )
+        .await?;
+        if has_errors(&issues) {
+            return Err(validation_error(&issues));
+        }
+
         self.controller.stop().await?;
 
         let snapshot = snapshot_before_mutation(&plan, server_root)?;
@@ -178,21 +194,16 @@ impl Updater {
             &prepared.overlay_files,
             self.controller.as_ref(),
         )
-        .await?;
+        .await
+        .map_err(|error| snapshot_context(&snapshot, error))?;
         if has_errors(&issues) {
-            let error_messages: Vec<String> = issues
-                .iter()
-                .filter(|issue| issue.severity == Severity::Error)
-                .map(|issue| issue.message.clone())
-                .collect();
-            return Err(PackError::Validation(format!(
-                "{}\nThe new version was not committed.\nRollback snapshot:\n  {}",
-                error_messages.join("\n"),
-                snapshot.dir.display()
-            )));
+            return Err(snapshot_context(&snapshot, validation_error(&issues)));
         }
 
-        self.controller.start().await?;
+        self.controller
+            .start()
+            .await
+            .map_err(|error| snapshot_context(&snapshot, error))?;
 
         let managed_files = managed_files_from_prepared(
             &FilePolicy::default_policy(),
@@ -205,7 +216,9 @@ impl Updater {
             managed_files,
             last_successful_update: Some(Utc::now()),
         };
-        StateStore::at(server_root)?.save(&new_state)?;
+        StateStore::at(server_root)
+            .and_then(|store| store.save(&new_state))
+            .map_err(|error| snapshot_context(&snapshot, error))?;
 
         Ok(UpdateOutcome {
             upstream_writes,
@@ -301,10 +314,23 @@ fn rel_key(rel: &Path) -> String {
 /// has begun, a failed update must always point at the snapshot that restores
 /// the previous version.
 fn snapshot_context(snapshot: &Snapshot, cause: PackError) -> PackError {
-    PackError::Other(format!(
+    let message = format!(
         "{cause}\nThe new version was not committed.\nRollback snapshot:\n  {}",
         snapshot.dir.display()
-    ))
+    );
+    match cause {
+        PackError::Validation(_) => PackError::Validation(message),
+        _ => PackError::Other(message),
+    }
+}
+
+fn validation_error(issues: &[crate::core::validation::ValidationIssue]) -> PackError {
+    let messages: Vec<String> = issues
+        .iter()
+        .filter(|issue| issue.severity == Severity::Error)
+        .map(|issue| issue.message.clone())
+        .collect();
+    PackError::Validation(messages.join("\n"))
 }
 
 #[cfg(test)]
@@ -624,11 +650,12 @@ mod tests {
             .unwrap();
         let err = updater.execute(&prepared).await.unwrap_err();
         assert!(
-            matches!(err, PackError::Controller(_)),
-            "expected Controller error, got {err:?}"
+            matches!(err, PackError::Validation(_)),
+            "expected preflight Validation error, got {err:?}"
         );
 
-        assert!(!server_root.join(".packctl").exists());
+        assert!(server_root.join(".packctl").join("update.lock").exists());
+        assert!(!server_root.join(".packctl").join("state.json").exists());
         assert!(!server_root.join("mods/upstream.jar").exists());
         assert!(!server_root.join("config/upstream.toml").exists());
     }
@@ -739,10 +766,9 @@ mod tests {
                     "message: {message}"
                 );
                 assert!(
-                    message.contains("The new version was not committed."),
-                    "message: {message}"
+                    !message.contains("Rollback snapshot:"),
+                    "preflight errors must not create a rollback snapshot: {message}"
                 );
-                assert!(message.contains("Rollback snapshot:"), "message: {message}");
             }
             other => panic!("expected Validation error, got {other:?}"),
         }
@@ -750,8 +776,8 @@ mod tests {
         assert!(!server_root.join(".packctl").join("state.json").exists());
         assert_eq!(
             snapshot_count(&server_root),
-            1,
-            "snapshot is created before validation runs"
+            0,
+            "preflight validation runs before stopping or snapshotting"
         );
     }
 

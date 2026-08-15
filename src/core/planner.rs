@@ -11,9 +11,7 @@
 //! the overlay always wins over upstream, and persistent runtime data is never
 //! touched merely because it is absent from a new pack version.
 //!
-//! The public API in this module is consumed by the executor/CLI modules,
-//! which are not implemented yet. Allow dead_code so the ready API surface
-//! does not emit warnings while the rest of the core is being built out.
+//! The public API in this module is consumed by the executor and CLI modules.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,6 +22,8 @@ use crate::core::overlay::OverlayFile;
 use crate::core::ownership::FilePolicy;
 use crate::core::state::InstalledState;
 use crate::error::Result;
+use crate::fs::hashing::sha256_file;
+use crate::fs::paths::safe_join;
 use crate::providers::{PreparedFile, PreparedPack};
 
 /// What should happen to a managed file.
@@ -133,6 +133,29 @@ impl UpdatePlanner {
         desired: &PreparedPack,
         overlay: &[OverlayFile],
     ) -> Result<UpdatePlan> {
+        self.build_plan_with_live_root(from, desired, overlay, None)
+    }
+
+    /// Builds a plan while checking that files recorded as managed still match
+    /// their persisted fingerprints. Missing or modified files are replaced
+    /// even when the desired upstream fingerprint is unchanged.
+    pub fn build_plan_for_server(
+        &self,
+        from: &InstalledState,
+        desired: &PreparedPack,
+        overlay: &[OverlayFile],
+        server_root: &Path,
+    ) -> Result<UpdatePlan> {
+        self.build_plan_with_live_root(from, desired, overlay, Some(server_root))
+    }
+
+    fn build_plan_with_live_root(
+        &self,
+        from: &InstalledState,
+        desired: &PreparedPack,
+        overlay: &[OverlayFile],
+        server_root: Option<&Path>,
+    ) -> Result<UpdatePlan> {
         let desired_files: HashMap<String, &PreparedFile> = desired
             .files
             .iter()
@@ -194,8 +217,17 @@ impl UpdatePlanner {
                         sha256: Some(desired_file.sha256.clone()),
                     });
                 }
-                // Present with the same content: unchanged, skip.
-                Some(_) => {}
+                Some(managed) if live_file_matches(server_root, rel, managed)? => {}
+                // A managed file missing from disk or altered outside packctl
+                // must be restored from the staged authoritative content.
+                Some(_) => {
+                    modifications.push(FileChange {
+                        rel_path: desired_file.rel_path.clone(),
+                        kind: ChangeKind::Replace,
+                        source: Some(source),
+                        sha256: Some(desired_file.sha256.clone()),
+                    });
+                }
                 None => {
                     additions.push(FileChange {
                         rel_path: desired_file.rel_path.clone(),
@@ -265,6 +297,31 @@ impl UpdatePlanner {
             notices,
         })
     }
+}
+
+fn live_file_matches(
+    server_root: Option<&Path>,
+    rel: &Path,
+    managed: &crate::core::state::ManagedFile,
+) -> Result<bool> {
+    let Some(root) = server_root else {
+        return Ok(true);
+    };
+    let path = safe_join(root, rel)?;
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(crate::error::PackError::io(
+                format!("stat managed file '{}'", path.display()),
+                error,
+            ));
+        }
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != managed.size {
+        return Ok(false);
+    }
+    Ok(sha256_file(&path)? == managed.sha256)
 }
 
 /// Converts a relative path to the forward-slash string key used by managed
@@ -652,6 +709,27 @@ mod tests {
 
         assert!(plan.is_empty());
         assert_eq!(plan.upstream_change_count(), 0);
+    }
+
+    #[test]
+    fn live_plan_replaces_missing_or_tampered_managed_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("server");
+        std::fs::create_dir_all(root.join("mods")).unwrap();
+        std::fs::write(root.join("mods/a.jar"), b"tampered").unwrap();
+        let mut from = InstalledState::default();
+        from.managed_files
+            .insert("mods/a.jar".to_string(), managed("expected", 8));
+        let desired = pack("1", "id-1", vec![staged("mods/a.jar", "expected")]);
+        let plan = UpdatePlanner::new(FilePolicy::default_policy())
+            .build_plan_for_server(&from, &desired, &[], &root)
+            .unwrap();
+        assert_eq!(rels(&plan.modifications), vec![PathBuf::from("mods/a.jar")]);
+        std::fs::remove_file(root.join("mods/a.jar")).unwrap();
+        let plan = UpdatePlanner::new(FilePolicy::default_policy())
+            .build_plan_for_server(&from, &desired, &[], &root)
+            .unwrap();
+        assert_eq!(rels(&plan.modifications), vec![PathBuf::from("mods/a.jar")]);
     }
 
     #[test]
