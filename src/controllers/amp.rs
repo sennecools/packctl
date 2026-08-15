@@ -52,8 +52,8 @@ impl AmpController {
     /// Build a controller from a profile `[controller]` section.
     ///
     /// Requires the `amp` controller kind and a non-empty `instance`. The
-    /// `[controller.command]` timeout is intentionally not honored: AMP calls
-    /// always use the default [`DEFAULT_TIMEOUT_MS`] instead.
+    /// When a command configuration is present, its timeout is also used for
+    /// AMP lifecycle calls; otherwise AMP uses [`DEFAULT_TIMEOUT_MS`].
     pub fn from_profile(controller: &ControllerSection) -> Result<Self> {
         if controller.kind != ControllerKind::Amp {
             return Err(PackError::Controller(format!(
@@ -71,7 +71,15 @@ impl AmpController {
                 "amp controller requires a non-empty 'instance'".into(),
             ));
         }
-        Ok(AmpController::new(instance.to_string()))
+        Ok(AmpController::with_binary(
+            DEFAULT_AMP_INSTMGR.to_string(),
+            instance.to_string(),
+            controller
+                .command
+                .as_ref()
+                .and_then(|command| command.timeout_ms)
+                .unwrap_or(DEFAULT_TIMEOUT_MS),
+        ))
     }
 
     /// `ampinstmgr status <instance>`
@@ -154,7 +162,7 @@ fn parse_status_output(output: &str) -> ServerStatus {
     let text = output.to_lowercase();
     if text.contains("running") {
         ServerStatus::Running
-    } else if text.contains("stopping") || text.contains("stopped") {
+    } else if text.contains("stopped") {
         ServerStatus::Stopped
     } else {
         ServerStatus::Unknown
@@ -328,7 +336,7 @@ mod tests {
         );
         assert_eq!(
             parse_status_output("Stopping instance 'ATM10'..."),
-            ServerStatus::Stopped
+            ServerStatus::Unknown
         );
         assert_eq!(parse_status_output(""), ServerStatus::Unknown);
         assert_eq!(
@@ -348,6 +356,24 @@ mod tests {
         assert_eq!(ctrl.ampinstmgr, "ampinstmgr");
         assert_eq!(ctrl.instance, "ATM10");
         assert_eq!(ctrl.timeout_ms, DEFAULT_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn from_profile_honors_configured_timeout() {
+        let section = ControllerSection {
+            kind: ControllerKind::Amp,
+            instance: Some("ATM10".into()),
+            command: Some(crate::config::profile::CommandConfig {
+                status: vec![],
+                stop: vec![],
+                start: vec![],
+                timeout_ms: Some(5_000),
+            }),
+        };
+        assert_eq!(
+            AmpController::from_profile(&section).unwrap().timeout_ms,
+            5_000
+        );
     }
 
     #[test]
