@@ -32,6 +32,7 @@ use crate::core::validation::{Severity, has_errors, validate};
 use crate::error::{PackError, Result};
 use crate::providers::curseforge::client::CfClient;
 use crate::providers::curseforge::installer::CurseForgeProvider;
+use crate::providers::local::LocalArchiveProvider;
 use crate::providers::{PackProvider, PackRef, PreparedPack, VersionSelector};
 
 /// Everything needed to run a single planned update.
@@ -75,18 +76,22 @@ impl Updater {
 
     /// Build an updater from a profile's configured provider and controller.
     ///
-    /// Only CurseForge packs are supported in V1; any other provider is a
-    /// configuration error.
+    /// CurseForge packs need an API key (from `$CF_API_KEY` or the profile);
+    /// local archives need no credentials.
     pub fn from_profile(profile: &ServerProfile) -> Result<Self> {
-        if profile.pack.provider != ProviderKind::CurseForge {
-            return Err(PackError::Config(format!(
-                "unsupported pack provider {:?}: only CurseForge is supported",
-                profile.pack.provider
-            )));
-        }
-        let provider: Box<dyn PackProvider> = Box::new(CurseForgeProvider::new(
-            CfClient::with_api_key(profile.curseforge_api_key()?),
-        ));
+        let provider: Box<dyn PackProvider> = match profile.pack.provider {
+            ProviderKind::CurseForge => Box::new(CurseForgeProvider::new(CfClient::with_api_key(
+                profile.curseforge_api_key()?,
+            ))),
+            ProviderKind::Local => {
+                let archive = profile.pack.archive.clone().ok_or_else(|| {
+                    PackError::Config(
+                        "pack provider 'local' requires an 'archive' path".to_string(),
+                    )
+                })?;
+                Box::new(LocalArchiveProvider::new(archive))
+            }
+        };
         let controller = crate::controllers::from_profile(&profile.controller)?;
         Ok(Updater {
             profile: profile.clone(),
@@ -538,6 +543,7 @@ mod tests {
                 provider: ProviderKind::CurseForge,
                 project_id: 42,
                 slug: None,
+                archive: None,
             },
             overlay: OverlaySection {
                 path: overlay.to_path_buf(),
@@ -791,5 +797,44 @@ mod tests {
         assert_eq!(updater.profile.name, "test-server");
         assert_eq!(updater.pack_ref().project_id, 42);
         assert!(updater.pack_ref().slug.is_empty());
+    }
+
+    #[tokio::test]
+    async fn from_profile_builds_local_archive_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut profile = profile(&tmp.path().join("server"), &tmp.path().join("overlay"));
+        profile.pack = PackSection {
+            provider: ProviderKind::Local,
+            project_id: 0,
+            slug: None,
+            archive: Some(PathBuf::from("/packs/server-pack.zip")),
+        };
+
+        let updater = Updater::from_profile(&profile).unwrap();
+
+        let err = updater
+            .provider
+            .list_versions(&updater.pack_ref())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("/packs/server-pack.zip"),
+            "expected the local provider to fail on the missing archive, got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_profile_local_without_archive_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut profile = profile(&tmp.path().join("server"), &tmp.path().join("overlay"));
+        profile.pack = PackSection {
+            provider: ProviderKind::Local,
+            project_id: 0,
+            slug: None,
+            archive: None,
+        };
+
+        let err = Updater::from_profile(&profile).err().unwrap();
+        assert!(matches!(err, PackError::Config(_)));
     }
 }

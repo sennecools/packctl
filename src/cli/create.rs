@@ -27,6 +27,10 @@ pub struct CreateArgs {
     /// current directory.
     pub global: bool,
     pub source: Option<String>,
+    /// Pack provider kind: "curseforge" (default) or "local".
+    pub provider: Option<String>,
+    /// Local archive path (zip file or directory of zips) for `--provider local`.
+    pub archive: Option<PathBuf>,
     /// CurseForge API key to store (encrypted) with the new profile.
     pub apikey: Option<String>,
     pub root: Option<PathBuf>,
@@ -75,28 +79,44 @@ impl From<&CreateArgs> for CommandOptions {
 pub async fn run(args: CreateArgs) -> Result<()> {
     let interactive = !args.non_interactive && std::io::stdin().is_terminal();
 
+    let provider = resolve_provider_kind(args.provider.as_deref())?;
     let name = resolve_name(args.name.as_deref(), interactive)?;
-    let api_key = resolve_api_key(args.apikey.clone(), interactive)?;
-    let client = match &api_key {
-        Some(key) => CfClient::with_api_key(Some(key.clone())),
-        None => CfClient::from_env()?,
-    };
-    let pack = resolve_pack(&client, args.source.clone(), interactive).await?;
 
-    if interactive {
-        let confirmed = dialoguer::Confirm::new()
-            .with_prompt(format!(
-                "Found '{}' (project {})",
-                pack.name, pack.project_id
-            ))
-            .default(true)
-            .interact()
-            .map_err(|err| dialoguer_error("confirm pack selection", err))?;
-        if !confirmed {
-            println!("Aborted.");
-            return Ok(());
+    let (pack, archive, api_key) = match provider {
+        ProviderKind::CurseForge => {
+            let api_key = resolve_api_key(args.apikey.clone(), interactive)?;
+            let client = match &api_key {
+                Some(key) => CfClient::with_api_key(Some(key.clone())),
+                None => CfClient::from_env()?,
+            };
+            let pack = resolve_pack(&client, args.source.clone(), interactive).await?;
+
+            if interactive {
+                let confirmed = dialoguer::Confirm::new()
+                    .with_prompt(format!(
+                        "Found '{}' (project {})",
+                        pack.name, pack.project_id
+                    ))
+                    .default(true)
+                    .interact()
+                    .map_err(|err| dialoguer_error("confirm pack selection", err))?;
+                if !confirmed {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
+            (pack, None, api_key)
         }
-    }
+        ProviderKind::Local => {
+            let archive = resolve_archive(args.archive.clone(), interactive)?;
+            let pack = ResolvedPack {
+                name: archive_display_name(&archive),
+                slug: String::new(),
+                project_id: 0,
+            };
+            (pack, Some(archive), None)
+        }
+    };
 
     let cwd =
         env::current_dir().map_err(|err| PackError::io("determine current directory", err))?;
@@ -118,9 +138,10 @@ pub async fn run(args: CreateArgs) -> Result<()> {
         } else {
             relativize(&cwd, &root)
         },
-        provider: ProviderKind::CurseForge,
+        provider,
         project_id: pack.project_id,
         slug: (!pack.slug.is_empty()).then(|| pack.slug.clone()),
+        archive,
         overlay_path: if args.global {
             overlay.clone()
         } else {
@@ -141,7 +162,12 @@ pub async fn run(args: CreateArgs) -> Result<()> {
     println!();
     println!("Created profile '{}'", draft.name);
     println!("  file:       {}", path.display());
-    println!("  pack:       {} (project {})", pack.name, pack.project_id);
+    match provider {
+        ProviderKind::CurseForge => {
+            println!("  pack:       {} (project {})", pack.name, pack.project_id)
+        }
+        ProviderKind::Local => println!("  pack:       {} (local archive)", pack.name),
+    }
     println!("  server:     {}", root.display());
     println!("  overlay:    {}", overlay.display());
     println!("  controller: {}", controller_description(&draft));
@@ -157,6 +183,75 @@ pub async fn run(args: CreateArgs) -> Result<()> {
         println!("Next: packctl status");
     }
     Ok(())
+}
+
+/// Parses the `--provider` value, defaulting to CurseForge.
+fn resolve_provider_kind(value: Option<&str>) -> Result<ProviderKind> {
+    match value {
+        None | Some("curseforge") => Ok(ProviderKind::CurseForge),
+        Some("local") => Ok(ProviderKind::Local),
+        Some(other) => Err(PackError::Config(format!(
+            "unknown provider '{other}'; expected 'curseforge' or 'local'"
+        ))),
+    }
+}
+
+/// Resolves the local archive path, prompting when interactive and omitted.
+fn resolve_archive(flag: Option<PathBuf>, interactive: bool) -> Result<PathBuf> {
+    let resolved = match flag {
+        Some(path) => {
+            let cwd = env::current_dir()
+                .map_err(|err| PackError::io("determine current directory", err))?;
+            absolute_path(&path, &cwd)
+        }
+        None if interactive => {
+            let input: String = dialoguer::Input::new()
+                .with_prompt("Server pack archive (zip file or directory of zips)")
+                .interact_text()
+                .map_err(|err| dialoguer_error("read archive path", err))?;
+            absolute_path(Path::new(&input.trim()), &cwd_env()?)
+        }
+        None => {
+            return Err(PackError::Config(
+                "--provider local requires --archive <path> in non-interactive mode".to_string(),
+            ));
+        }
+    };
+
+    let metadata = std::fs::metadata(&resolved).map_err(|err| {
+        PackError::Config(format!(
+            "archive '{}' is not accessible: {err}",
+            resolved.display()
+        ))
+    })?;
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err(PackError::Config(format!(
+            "archive '{}' is neither a file nor a directory",
+            resolved.display()
+        )));
+    }
+    Ok(resolved)
+}
+
+fn cwd_env() -> Result<PathBuf> {
+    env::current_dir().map_err(|err| PackError::io("determine current directory", err))
+}
+
+/// A human-friendly label for a local archive path: the file stem when it looks
+/// like a file (has an extension), otherwise the directory name.
+fn archive_display_name(path: &Path) -> String {
+    if path.extension().is_some() {
+        path.file_stem()
+            .or_else(|| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| path.display().to_string())
+    } else {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| path.display().to_string())
+    }
 }
 
 /// Resolves the optional API key to store with the profile.
@@ -554,6 +649,64 @@ mod tests {
     }
 
     #[test]
+    fn resolve_provider_kind_defaults_to_curseforge() {
+        assert_eq!(
+            resolve_provider_kind(None).unwrap(),
+            ProviderKind::CurseForge
+        );
+        assert_eq!(
+            resolve_provider_kind(Some("curseforge")).unwrap(),
+            ProviderKind::CurseForge
+        );
+        assert_eq!(
+            resolve_provider_kind(Some("local")).unwrap(),
+            ProviderKind::Local
+        );
+        assert!(matches!(
+            resolve_provider_kind(Some("modrinth")),
+            Err(PackError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn archive_display_name_uses_stem_for_files_and_dir_name_for_directories() {
+        assert_eq!(
+            archive_display_name(Path::new("/packs/FTB StoneBlock 4 1.19.1.zip")),
+            "FTB StoneBlock 4 1.19.1"
+        );
+        assert_eq!(
+            archive_display_name(Path::new("/packs/sb4-archives")),
+            "sb4-archives"
+        );
+        assert_eq!(
+            archive_display_name(Path::new("/packs/archive.zip")),
+            "archive"
+        );
+    }
+
+    #[test]
+    fn resolve_archive_requires_existing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("pack.zip");
+        std::fs::write(&existing, b"zip").unwrap();
+
+        let resolved = resolve_archive(Some(existing.clone()), false).unwrap();
+        assert_eq!(resolved, existing);
+
+        let missing = resolve_archive(Some(dir.path().join("nope.zip")), false);
+        assert!(matches!(missing, Err(PackError::Config(_))));
+    }
+
+    #[test]
+    fn resolve_archive_non_interactive_without_flag_errors() {
+        let err = resolve_archive(None, false).unwrap_err();
+        assert!(
+            matches!(&err, PackError::Config(message) if message.contains("--archive")),
+            "error: {err:?}"
+        );
+    }
+
+    #[test]
     fn absolute_path_joins_against_cwd() {
         assert_eq!(
             absolute_path(Path::new("server"), Path::new("/srv")),
@@ -573,6 +726,7 @@ mod tests {
             provider: ProviderKind::CurseForge,
             project_id: 1,
             slug: None,
+            archive: None,
             overlay_path: PathBuf::from("/srv/overlay"),
             controller: ControllerKind::Amp,
             instance: Some("ATM10".to_string()),

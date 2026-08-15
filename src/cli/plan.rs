@@ -155,6 +155,7 @@ mod tests {
                 provider: ProviderKind::CurseForge,
                 project_id: 925200,
                 slug: Some("atm10".to_string()),
+                archive: None,
             },
             overlay: OverlaySection {
                 path: PathBuf::from("/srv/overlay"),

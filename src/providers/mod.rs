@@ -5,6 +5,7 @@
 //! works.
 
 pub mod curseforge;
+pub mod local;
 
 use std::path::{Path, PathBuf};
 
@@ -77,4 +78,25 @@ pub trait PackProvider {
         selector: &VersionSelector,
     ) -> Result<ResolvedPackVersion>;
     async fn prepare(&self, version: &ResolvedPackVersion, staging: &Path) -> Result<PreparedPack>;
+}
+
+/// Resolves a version selector against a version list.
+///
+/// `Latest` picks the first entry, so providers must return their lists sorted
+/// newest first. `Id` matches the provider-internal id or, when present, the
+/// provider file id. `Name` matches the human-readable name case-insensitively.
+pub(crate) fn resolve_version_from_list<'a>(
+    versions: &'a [PackVersion],
+    selector: &VersionSelector,
+) -> Option<&'a PackVersion> {
+    match selector {
+        VersionSelector::Latest => versions.first(),
+        VersionSelector::Id(id) => versions
+            .iter()
+            .find(|v| v.id == *id || v.file_id.is_some_and(|file_id| file_id.to_string() == *id)),
+        VersionSelector::Name(name) => {
+            let needle = name.to_lowercase();
+            versions.iter().find(|v| v.name.to_lowercase() == needle)
+        }
+    }
 }

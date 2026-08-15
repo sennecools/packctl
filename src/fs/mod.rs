@@ -5,5 +5,6 @@
 //! path safety helpers before use.
 
 pub mod copy;
+pub mod extract;
 pub mod hashing;
 pub mod paths;

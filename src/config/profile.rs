@@ -18,6 +18,7 @@ use crate::error::{PackError, Result};
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
     CurseForge,
+    Local,
 }
 
 /// Kind of server controller.
@@ -50,6 +51,9 @@ pub struct PackSection {
     pub provider: ProviderKind,
     pub project_id: u32,
     pub slug: Option<String>,
+    /// Local archive path (zip file or directory of zips) when the provider is
+    /// `local`.
+    pub archive: Option<PathBuf>,
 }
 
 /// Where the mirrored local overlay lives.
@@ -127,8 +131,11 @@ struct RawServer {
 #[derive(Debug, Deserialize)]
 struct RawPack {
     provider: ProviderKind,
+    #[serde(default)]
     project_id: u32,
     slug: Option<String>,
+    #[serde(default)]
+    archive: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -304,10 +311,17 @@ impl RawProfile {
         let server = ServerSection {
             root: resolve_against_config(config_dir, &self.server.root)?,
         };
+        self.pack.validate()?;
         let pack = PackSection {
             provider: self.pack.provider,
             project_id: self.pack.project_id,
             slug: self.pack.slug,
+            archive: self
+                .pack
+                .archive
+                .as_ref()
+                .map(|path| resolve_against_config(config_dir, path))
+                .transpose()?,
         };
         let overlay = OverlaySection {
             path: resolve_against_config(config_dir, &self.overlay.path)?,
@@ -322,6 +336,20 @@ impl RawProfile {
             controller,
             secrets: self.secrets,
         })
+    }
+}
+
+impl RawPack {
+    fn validate(&self) -> Result<()> {
+        match self.provider {
+            ProviderKind::CurseForge if self.project_id == 0 => Err(PackError::Config(
+                "pack provider 'curseforge' requires a non-zero 'project_id'".to_string(),
+            )),
+            ProviderKind::Local if self.archive.as_deref().is_none() => Err(PackError::Config(
+                "pack provider 'local' requires an 'archive' path".to_string(),
+            )),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -381,6 +409,9 @@ pub struct ProfileDraft {
     pub project_id: u32,
     /// Human-friendly pack identifier; written only when non-empty.
     pub slug: Option<String>,
+    /// Local archive path (zip file or directory of zips) when the provider is
+    /// `local`.
+    pub archive: Option<PathBuf>,
     pub overlay_path: PathBuf,
     pub controller: ControllerKind,
     /// AMP instance name, required when `controller` is `Amp`.
@@ -455,6 +486,7 @@ fn profile_write_from_draft(draft: &ProfileDraft) -> ProfileWrite {
             provider: draft.provider,
             project_id: draft.project_id,
             slug: draft.slug.clone(),
+            archive: draft.archive.clone(),
         },
         overlay: OverlayWrite {
             path: draft.overlay_path.clone(),
@@ -609,9 +641,16 @@ struct ServerWrite {
 #[derive(Debug, Serialize)]
 struct PackWrite {
     provider: ProviderKind,
+    #[serde(skip_serializing_if = "is_zero")]
     project_id: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     slug: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archive: Option<PathBuf>,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Serialize)]
@@ -712,6 +751,74 @@ instance = "ATM10"
 
         let profile = load_profile("my-server").unwrap();
         assert_eq!(profile.name, "my-server");
+    }
+
+    #[test]
+    fn local_profile_parses_archive_relative_to_config_dir() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("PACKCTL_HOME", dir.path().as_os_str());
+
+        let content = r#"
+[server]
+root = "/srv/mc"
+
+[pack]
+provider = "local"
+archive = "./packs/server-pack.zip"
+
+[overlay]
+path = "overlay"
+
+[controller]
+type = "amp"
+instance = "x"
+"#;
+        fs::write(dir.path().join("sb4.toml"), content).unwrap();
+
+        let profile = load_profile("sb4").unwrap();
+        assert_eq!(profile.pack.provider, ProviderKind::Local);
+        assert_eq!(profile.pack.project_id, 0);
+        assert_eq!(
+            profile.pack.archive.as_deref(),
+            Some(dir.path().join("packs/server-pack.zip").as_path())
+        );
+    }
+
+    #[test]
+    fn local_profile_without_archive_errors() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("PACKCTL_HOME", dir.path().as_os_str());
+
+        let content = "[server]\nroot = \"/srv/mc\"\n\n[pack]\nprovider = \"local\"\n\n[overlay]\npath = \"overlay\"\n\n"
+            .to_string()
+            + AMP_CONTROLLER;
+        fs::write(dir.path().join("bad.toml"), content).unwrap();
+
+        let err = load_profile("bad").unwrap_err();
+        assert!(
+            matches!(&err, PackError::Config(message) if message.contains("archive")),
+            "expected Config error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn curseforge_profile_without_project_id_errors() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("PACKCTL_HOME", dir.path().as_os_str());
+
+        let content = "[server]\nroot = \"/srv/mc\"\n\n[pack]\nprovider = \"curseforge\"\n\n[overlay]\npath = \"overlay\"\n\n"
+            .to_string()
+            + AMP_CONTROLLER;
+        fs::write(dir.path().join("bad.toml"), content).unwrap();
+
+        let err = load_profile("bad").unwrap_err();
+        assert!(
+            matches!(&err, PackError::Config(message) if message.contains("project_id")),
+            "expected Config error, got {err:?}"
+        );
     }
 
     #[test]
@@ -935,6 +1042,7 @@ timeout_ms = 30000
             provider: ProviderKind::CurseForge,
             project_id: 925200,
             slug: Some("all-the-mods-10".to_string()),
+            archive: None,
             overlay_path: PathBuf::from("/srv/atm10/overlay"),
             controller: ControllerKind::Amp,
             instance: Some("ATM10".to_string()),
@@ -969,6 +1077,7 @@ timeout_ms = 30000
             provider: ProviderKind::CurseForge,
             project_id: 1,
             slug: None,
+            archive: None,
             overlay_path: PathBuf::from("/srv/mc/overlay"),
             controller: ControllerKind::Command,
             instance: None,
@@ -1018,6 +1127,7 @@ timeout_ms = 30000
             provider: ProviderKind::CurseForge,
             project_id: 1,
             slug: None,
+            archive: None,
             overlay_path: PathBuf::from("/srv/atm10/overlay"),
             controller: ControllerKind::Amp,
             instance: Some("ATM10".to_string()),
@@ -1037,6 +1147,46 @@ timeout_ms = 30000
     }
 
     #[test]
+    fn write_profile_round_trips_local() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("PACKCTL_HOME", dir.path().as_os_str());
+
+        let draft = ProfileDraft {
+            name: "sb4".to_string(),
+            server_root: PathBuf::from("/srv/sb4"),
+            provider: ProviderKind::Local,
+            project_id: 0,
+            slug: None,
+            archive: Some(PathBuf::from("/packs/server-pack.zip")),
+            overlay_path: PathBuf::from("/srv/sb4/overlay"),
+            controller: ControllerKind::Amp,
+            instance: Some("Stoneblock401".to_string()),
+            command: None,
+            secrets: None,
+        };
+
+        let path = write_profile(&draft, false).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("provider = \"local\""),
+            "content: {content}"
+        );
+        assert!(
+            content.contains("archive = \"/packs/server-pack.zip\""),
+            "content: {content}"
+        );
+        assert!(!content.contains("project_id"), "content: {content}");
+
+        let profile = load_profile("sb4").unwrap();
+        assert_eq!(profile.pack.provider, ProviderKind::Local);
+        assert_eq!(
+            profile.pack.archive.as_deref(),
+            Some(Path::new("/packs/server-pack.zip"))
+        );
+    }
+
+    #[test]
     fn write_profile_rejects_unsafe_names() {
         let _lock = env_lock();
         let dir = tempfile::tempdir().unwrap();
@@ -1048,6 +1198,7 @@ timeout_ms = 30000
             provider: ProviderKind::CurseForge,
             project_id: 1,
             slug: None,
+            archive: None,
             overlay_path: PathBuf::from("/srv/overlay"),
             controller: ControllerKind::Amp,
             instance: Some("x".to_string()),
@@ -1075,6 +1226,7 @@ timeout_ms = 30000
             provider: ProviderKind::CurseForge,
             project_id: 925200,
             slug: None,
+            archive: None,
             overlay_path: PathBuf::from("overlay"),
             controller: ControllerKind::Amp,
             instance: Some("my-server".to_string()),
@@ -1177,6 +1329,7 @@ timeout_ms = 30000
             provider: ProviderKind::CurseForge,
             project_id: 1,
             slug: None,
+            archive: None,
             overlay_path: PathBuf::from("/srv/atm10/overlay"),
             controller: ControllerKind::Amp,
             instance: Some("x".to_string()),

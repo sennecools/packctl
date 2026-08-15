@@ -284,6 +284,7 @@ mod tests {
                 provider: ProviderKind::CurseForge,
                 project_id: 1,
                 slug: None,
+                archive: None,
             },
             overlay: OverlaySection {
                 path: overlay.to_path_buf(),

@@ -57,6 +57,12 @@ pub enum Command {
         /// CurseForge modpack URL, project ID, or slug (defaults to a prompt)
         #[arg(long)]
         source: Option<String>,
+        /// Pack provider kind: "curseforge" (default) or "local"
+        #[arg(long)]
+        provider: Option<String>,
+        /// Local archive path (zip file or directory of zips) for --provider local
+        #[arg(long)]
+        archive: Option<PathBuf>,
         /// CurseForge API key to store (encrypted) with the new profile
         #[arg(long)]
         apikey: Option<String>,
@@ -159,6 +165,8 @@ pub async fn run() -> Result<()> {
             force,
             global,
             source,
+            provider,
+            archive,
             apikey,
             root,
             overlay,
@@ -175,6 +183,8 @@ pub async fn run() -> Result<()> {
                 force,
                 global,
                 source,
+                provider,
+                archive,
                 apikey,
                 root,
                 overlay,
