@@ -44,11 +44,13 @@ commit new state
 
 Preparation happens entirely before this: the target version is resolved, downloaded, and extracted into a **staging** directory, the overlay is scanned, and an exact plan is built. The live server is never touched during preparation, and `packctl plan` and `packctl update` use the same planner. If nothing changed, the plan is empty and the server is never stopped.
 
+The pack-owned folders are kept **in sync** with the selected version: each top-level folder the new pack ships (`mods/`, `config/`, `kubejs/`, `defaultconfigs/`, …) ends up exactly equal to the new pack plus your overlay. Stale files left behind by an earlier version are removed automatically — even on the very first update, so a server that was installed by other means still converges onto the pack.
+
 ### What `packctl` deliberately does not do
 
 - **No config merging.** There is no "smart" merge of TOML, JSON, YAML, SNBT, KubeJS, or properties files. The model is upstream first, overlay second.
-- **Unknown files are never deleted.** A file can only be removed if the updater can prove the previous upstream version managed it, the new version dropped it, and it is neither persistent nor overlay-provided. Anything else stays.
-- **Persistent runtime data is never touched.** `world/` and the other persistent paths below are excluded from the update plan entirely.
+- **Only pack-owned folders are swept.** Files are removed only inside folders the new pack ships, and only when they are neither part of the new pack nor provided by the overlay. Anything dropped directly into those folders without the overlay is removed on the next update — that is the trade-off for always staying in sync, and why your custom files belong in the overlay.
+- **Everything outside the pack's folders is never touched.** `libraries/`, `world/`, `logs/`, `backups/`, AMP/runtime files, and any folder the pack does not ship are never swept. Persistent runtime data (`world/` and the paths below) is excluded from the plan entirely, even if a pack ships it.
 - It is not a launcher, a modpack authoring tool, a generic mod updater, a hosting panel, a world backup system, or a replacement for AMP. It manages safe upstream modpack upgrades for self-hosted servers.
 
 ## Installation
@@ -307,6 +309,8 @@ Overlay conflict notice
 
 This is informational, not an error. `server.properties` is persistent by default, but it is treated as a managed file when it is present in the overlay — put it there and the updater applies your version and records it.
 
+Because pack-owned folders are swept to match the pack, a file dropped **directly** into a pack folder (without also placing it in the overlay) is removed on the next update. Your custom mods, configs, KubeJS scripts, datapacks, and so on must live in the overlay. The `overlay/` and `packs/` folders themselves are never swept.
+
 ## Persistent runtime data
 
 The updater never plans changes for these paths, even when a new modpack version ships them:
@@ -324,7 +328,7 @@ banned-ips.json
 usercache.json
 ```
 
-Everything else under the server root is treated as updater-managed content.
+The pack-owned folders (the top-level folders the installed version ships, such as `mods/`, `config/`, `kubejs/`, `defaultconfigs/`) are synced to match the pack plus the overlay. Everything outside them — `libraries/`, AMP/runtime files, and any other folder — is left exactly as it is.
 
 ## Commands
 
@@ -350,8 +354,8 @@ Safety is the top priority. The guarantees:
 - **Staging before mutation** — downloads, extraction, and preparation happen in a staging directory, never in the live server.
 - **Snapshot before mutation** — before any live file changes, the exact files the plan touches are copied to `server_root/.packctl/snapshots/<timestamp>/` along with a manifest and the previous `state.json`.
 - **Commit state last** — the new version is recorded only after files, overlay, and validation all succeeded. A failed update never leaves state claiming the new version is installed.
-- **Only previously-managed files can be removed** — removals require proof of prior upstream ownership, plus the file being absent from the new pack, non-persistent, and not overlay-provided.
-- **Unknown and persistent files are never touched** — untracked files have no plan entry and survive; persistent paths never enter the plan.
+- **Pack-owned folders are kept in sync** — every top-level folder the selected version ships is swept so it ends up exactly equal to the new pack plus the overlay. Stale files from an earlier version are removed even on the first update; this is what makes an unmanaged server converge onto the pack.
+- **Removals are scoped and protected** — a file is only removed inside a pack-owned folder, and only when it is not part of the new pack, not persistent, and not overlay-provided. Persistent runtime data and folders the pack does not ship never enter the plan, even when a pack ships the same path (`world/` and the others below are excluded entirely).
 - **Path safety** — archive, provider, config, and overlay paths are treated as untrusted. Traversal (`..`), absolute paths, empty components, and NUL bytes are rejected, and symlinks are not followed during destructive operations.
 - **No-op plans do nothing** — if the plan is empty, the server is not stopped, nothing is snapshotted, and nothing is committed.
 

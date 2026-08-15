@@ -13,7 +13,7 @@
 //!
 //! The public API in this module is consumed by the executor and CLI modules.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -21,10 +21,15 @@ use serde::{Deserialize, Serialize};
 use crate::core::overlay::OverlayFile;
 use crate::core::ownership::FilePolicy;
 use crate::core::state::InstalledState;
-use crate::error::Result;
+use crate::error::{PackError, Result};
 use crate::fs::hashing::sha256_file;
 use crate::fs::paths::safe_join;
 use crate::providers::{PreparedFile, PreparedPack};
+
+/// Top-level directory names that packctl reserves for its own infrastructure
+/// and never sweeps, even when a pack ships them: the profile/state directory,
+/// the default overlay location, and the default local-archive drop folder.
+const RESERVED_TOP_LEVEL_DIRS: &[&str] = &[".packctl", "overlay", "packs"];
 
 /// What should happen to a managed file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,23 +127,33 @@ impl UpdatePlanner {
         UpdatePlanner { policy }
     }
 
-    /// Compares `from` (what the updater previously managed) against `desired`
-    /// (the prepared upstream version, authoritative for pack-managed content)
-    /// and `overlay` (the mirrored local overlay, which always wins).
+    /// Conservative plan that treats the recorded managed state as the only
+    /// candidate set for removals.
     ///
-    /// Pure computation: never reads or mutates the live server.
+    /// This form does not walk the live server, so it cannot sweep unknown
+    /// files under pack-owned folders. It exists for pure unit tests and
+    /// callers that have no server root; authoritative planning goes through
+    /// [`UpdatePlanner::build_plan_for_server`].
     pub fn build_plan(
         &self,
         from: &InstalledState,
         desired: &PreparedPack,
         overlay: &[OverlayFile],
     ) -> Result<UpdatePlan> {
-        self.build_plan_with_live_root(from, desired, overlay, None)
+        let live: Vec<PathBuf> = from.managed_files.keys().map(PathBuf::from).collect();
+        self.build_plan_with_inputs(from, desired, overlay, &live, None)
     }
 
-    /// Builds a plan while checking that files recorded as managed still match
-    /// their persisted fingerprints. Missing or modified files are replaced
-    /// even when the desired upstream fingerprint is unchanged.
+    /// Builds a plan against a live server root.
+    ///
+    /// Pack-owned folders (the top-level directories shipped by the selected
+    /// upstream version) are swept: any file in them that is neither part of
+    /// the new upstream version nor provided by the overlay nor protected by
+    /// persistent-data policy is removed. This keeps the server exactly equal
+    /// to upstream + overlay even when no prior managed state exists. Files
+    /// outside pack-owned folders (e.g. `libraries/`, `world/`, unknown
+    /// top-level files, packctl's own `.packctl/`, `overlay/`, `packs/`) are
+    /// never touched.
     pub fn build_plan_for_server(
         &self,
         from: &InstalledState,
@@ -146,14 +161,19 @@ impl UpdatePlanner {
         overlay: &[OverlayFile],
         server_root: &Path,
     ) -> Result<UpdatePlan> {
-        self.build_plan_with_live_root(from, desired, overlay, Some(server_root))
+        let mut live = Vec::new();
+        for dir in pack_owned_dirs(desired) {
+            collect_live_files(server_root, Path::new(&dir), &self.policy, &mut live)?;
+        }
+        self.build_plan_with_inputs(from, desired, overlay, &live, Some(server_root))
     }
 
-    fn build_plan_with_live_root(
+    fn build_plan_with_inputs(
         &self,
         from: &InstalledState,
         desired: &PreparedPack,
         overlay: &[OverlayFile],
+        live: &[PathBuf],
         server_root: Option<&Path>,
     ) -> Result<UpdatePlan> {
         let desired_files: HashMap<String, &PreparedFile> = desired
@@ -172,19 +192,24 @@ impl UpdatePlanner {
 
         // Rule 1: removals.
         //
-        // A managed file may only be removed when it is no longer provided by
-        // the upstream version, is not protected by persistent-data policy,
-        // and is not provided by the overlay (overlay wins, so it stays on
-        // disk). Unknown/untracked files never enter the plan and survive.
-        for path in from.managed_files.keys() {
-            let rel = Path::new(path);
+        // Every file present in a pack-owned folder that the selected upstream
+        // version does not ship is removed, unless it is protected by
+        // persistent-data policy or provided by the overlay (overlay wins, so
+        // it stays on disk and is re-applied). This sweep applies to all files
+        // in those folders, regardless of prior managed state, so the first
+        // update of an unmanaged server already converges exactly onto
+        // upstream + overlay. Files outside pack-owned folders are never
+        // candidates for removal.
+        for path in live {
+            let rel = path.as_path();
             if self.policy.is_persistent(rel) {
                 continue;
             }
-            if overlay_files.contains_key(path) {
+            let key = rel_key(rel);
+            if overlay_files.contains_key(&key) {
                 continue;
             }
-            if !desired_files.contains_key(path) {
+            if !desired_files.contains_key(&key) {
                 removals.push(FileChange {
                     rel_path: rel.to_path_buf(),
                     kind: ChangeKind::Remove,
@@ -297,6 +322,79 @@ impl UpdatePlanner {
             notices,
         })
     }
+}
+
+/// Top-level directories the prepared upstream pack ships; these are the
+/// pack-owned regions swept during a sync update. Reserved packctl
+/// infrastructure directories are excluded so the overlay, the drop folder,
+/// and the state directory are never treated as pack content.
+fn pack_owned_dirs(desired: &PreparedPack) -> Vec<String> {
+    let mut dirs = BTreeSet::new();
+    for file in &desired.files {
+        let mut components = file.rel_path.components();
+        let Some(first) = components.next() else {
+            continue;
+        };
+        if components.next().is_none() {
+            continue;
+        }
+        if let Some(name) = first.as_os_str().to_str()
+            && !RESERVED_TOP_LEVEL_DIRS.contains(&name)
+        {
+            dirs.insert(name.to_string());
+        }
+    }
+    dirs.into_iter().collect()
+}
+
+/// Collects every regular file under `root/rel_dir` as a relative path.
+///
+/// Symlinks are never followed (and never returned), so a destructive sweep
+/// cannot cross or remove them. Persistent subtrees are skipped entirely so a
+/// `world/` or `logs/` living under a pack-owned folder is never walked or
+/// removed.
+fn collect_live_files(
+    root: &Path,
+    rel_dir: &Path,
+    policy: &FilePolicy,
+    out: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let dir = if rel_dir.as_os_str().is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel_dir)
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(PackError::io(format!("scan '{}'", dir.display()), error)),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => return Err(PackError::io(format!("scan '{}'", dir.display()), error)),
+        };
+        let path = entry.path();
+        let rel = rel_dir.join(entry.file_name());
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(PackError::io(format!("stat '{}'", path.display()), error)),
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            if !policy.is_persistent(&rel) {
+                collect_live_files(root, &rel, policy, out)?;
+            }
+            continue;
+        }
+        if metadata.is_file() {
+            out.push(rel);
+        }
+    }
+    Ok(())
 }
 
 fn live_file_matches(
@@ -838,5 +936,150 @@ mod tests {
             overlay_rels(&plan.overlay_changes),
             vec![PathBuf::from("config/a.toml"), PathBuf::from("mods/y.jar"),]
         );
+    }
+
+    fn write(root: &Path, rel: &str, data: &[u8]) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, data).unwrap();
+    }
+
+    #[test]
+    fn sync_sweeps_stale_files_under_pack_folders_even_without_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("server");
+        // A server that packctl has never touched.
+        write(&root, "mods/stale-old.jar", b"old");
+        write(&root, "mods/new.jar", b"new");
+
+        let desired = pack(
+            "2",
+            "id-2",
+            vec![staged("mods/new.jar", "new"), staged("config/x.toml", "x")],
+        );
+
+        let plan = UpdatePlanner::new(FilePolicy::default_policy())
+            .build_plan_for_server(&InstalledState::default(), &desired, &[], &root)
+            .unwrap();
+
+        assert_eq!(
+            rels(&plan.removals),
+            vec![PathBuf::from("mods/stale-old.jar")]
+        );
+        assert_eq!(
+            rels(&plan.additions),
+            vec![
+                PathBuf::from("config/x.toml"),
+                PathBuf::from("mods/new.jar"),
+            ]
+        );
+    }
+
+    #[test]
+    fn sync_never_touches_files_outside_pack_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("server");
+        write(&root, "libraries/net/lib.jar", b"runtime");
+        write(&root, "datapacks/custom/dp.json", b"data");
+        write(&root, "custom.txt", b"top level");
+
+        let desired = pack("1", "id-1", vec![staged("mods/a.jar", "a")]);
+
+        let plan = UpdatePlanner::new(FilePolicy::default_policy())
+            .build_plan_for_server(&InstalledState::default(), &desired, &[], &root)
+            .unwrap();
+
+        let paths = plan_paths(&plan);
+        assert!(!paths.contains(&PathBuf::from("libraries/net/lib.jar")));
+        assert!(!paths.contains(&PathBuf::from("datapacks/custom/dp.json")));
+        assert!(!paths.contains(&PathBuf::from("custom.txt")));
+    }
+
+    #[test]
+    fn sync_keeps_overlay_files_under_pack_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("server");
+        write(&root, "mods/stale.jar", b"stale");
+        write(&root, "mods/custom.jar", b"overlay");
+
+        let desired = pack("1", "id-1", vec![staged("mods/a.jar", "a")]);
+        let overlay = vec![overlay_file("mods/custom.jar", "overlay")];
+
+        let plan = UpdatePlanner::new(FilePolicy::default_policy())
+            .build_plan_for_server(&InstalledState::default(), &desired, &overlay, &root)
+            .unwrap();
+
+        let removals = rels(&plan.removals);
+        assert!(
+            !removals.contains(&PathBuf::from("mods/custom.jar")),
+            "overlay file must not be swept"
+        );
+        assert!(removals.contains(&PathBuf::from("mods/stale.jar")));
+    }
+
+    #[test]
+    fn sync_keeps_persistent_paths_even_under_pack_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("server");
+        // A pack that ships world/ must never wipe the live world.
+        write(&root, "world/region/r.mca", b"live world");
+        write(&root, "world/level.dat", b"live level");
+        write(&root, "world/region/old-backup.mca", b"stale backup");
+
+        let desired = pack(
+            "1",
+            "id-1",
+            vec![
+                staged("world/level.dat", "pack-level"),
+                staged("mods/a.jar", "a"),
+            ],
+        );
+
+        let plan = UpdatePlanner::new(FilePolicy::default_policy())
+            .build_plan_for_server(&InstalledState::default(), &desired, &[], &root)
+            .unwrap();
+
+        let paths = plan_paths(&plan);
+        assert!(
+            !paths.iter().any(|p| p.starts_with("world")),
+            "world must never be planned"
+        );
+        assert_eq!(rels(&plan.additions), vec![PathBuf::from("mods/a.jar")]);
+    }
+
+    #[test]
+    fn sync_never_sweeps_reserved_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("server");
+        write(&root, "packs/archive.zip", b"zip");
+        write(&root, "overlay/mods/grieflogger.jar", b"gr");
+        write(&root, ".packctl/state.json", b"{}");
+
+        let desired = pack("1", "id-1", vec![staged("mods/a.jar", "a")]);
+
+        let plan = UpdatePlanner::new(FilePolicy::default_policy())
+            .build_plan_for_server(&InstalledState::default(), &desired, &[], &root)
+            .unwrap();
+
+        let paths = plan_paths(&plan);
+        assert!(!paths.contains(&PathBuf::from("packs/archive.zip")));
+        assert!(!paths.contains(&PathBuf::from("overlay/mods/grieflogger.jar")));
+        assert!(!paths.contains(&PathBuf::from(".packctl/state.json")));
+    }
+
+    #[test]
+    fn sync_treats_missing_pack_folders_as_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("server");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let desired = pack("1", "id-1", vec![staged("mods/a.jar", "a")]);
+
+        let plan = UpdatePlanner::new(FilePolicy::default_policy())
+            .build_plan_for_server(&InstalledState::default(), &desired, &[], &root)
+            .unwrap();
+
+        assert_eq!(rels(&plan.removals), Vec::<PathBuf>::new());
+        assert_eq!(rels(&plan.additions), vec![PathBuf::from("mods/a.jar")]);
     }
 }

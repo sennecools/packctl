@@ -8,7 +8,9 @@
 //! because it is absent from a new modpack version) from updater-managed files.
 //! `server.properties` is persistent by default, but is intentionally managed
 //! when explicitly present in the overlay; the planner/overlay layer handles
-//! that interaction.
+//! that interaction. The planner additionally sweeps pack-owned folders (the
+//! top-level directories shipped by the selected upstream version); everything
+//! outside them is classified `Unknown` and never removed.
 //!
 
 use std::path::Path;

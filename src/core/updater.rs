@@ -721,6 +721,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_update_sweeps_stale_pack_folder_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server_root = tmp.path().join("server");
+        std::fs::create_dir_all(server_root.join("mods")).unwrap();
+        std::fs::write(server_root.join("mods/stale-old.jar"), b"old").unwrap();
+        std::fs::create_dir_all(server_root.join("world/region")).unwrap();
+        std::fs::write(server_root.join("world/region/r.mca"), b"world").unwrap();
+
+        let overlay = tmp.path().join("overlay");
+        let profile = profile(&server_root, &overlay);
+        let controller = FakeController::new();
+        let updater = Updater::new(profile, Box::new(FakeProvider), Box::new(controller));
+
+        let prepared = updater
+            .prepare_update(&VersionSelector::Latest)
+            .await
+            .unwrap();
+        assert!(
+            prepared
+                .plan
+                .removals
+                .iter()
+                .any(|c| c.rel_path == *"mods/stale-old.jar"),
+            "a stale file in a pack-owned folder must be planned for removal even on a first update"
+        );
+
+        let outcome = updater.execute(&prepared).await.unwrap();
+        assert!(outcome.committed);
+        assert!(
+            !server_root.join("mods/stale-old.jar").exists(),
+            "stale file must be removed"
+        );
+        assert!(server_root.join("mods/upstream.jar").exists());
+        assert!(server_root.join("config/upstream.toml").exists());
+        assert_eq!(
+            std::fs::read(server_root.join("world/region/r.mca")).unwrap(),
+            b"world"
+        );
+    }
+
+    #[tokio::test]
     async fn empty_plan_skips_execution_without_contacting_server() {
         let tmp = tempfile::tempdir().unwrap();
         let server_root = tmp.path().join("server");
