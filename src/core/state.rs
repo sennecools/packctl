@@ -7,8 +7,10 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::{fs::File, io};
 
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{PackError, Result};
@@ -47,6 +49,17 @@ pub struct StateStore {
     pub path: PathBuf,
 }
 
+/// An exclusive per-server lock held while an update or rollback mutates files.
+pub struct ServerLock {
+    file: File,
+}
+
+impl Drop for ServerLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 impl StateStore {
     /// Returns the store for `server_root`.
     ///
@@ -83,6 +96,41 @@ impl StateStore {
         })
     }
 
+    /// Acquires the exclusive mutation lock for this server without waiting.
+    pub fn lock(&self) -> Result<ServerLock> {
+        let parent = self.path.parent().ok_or_else(|| {
+            PackError::State(format!(
+                "state path '{}' has no parent",
+                self.path.display()
+            ))
+        })?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            PackError::io(
+                format!("create state directory '{}'", parent.display()),
+                error,
+            )
+        })?;
+        let lock_path = parent.join("update.lock");
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| {
+                PackError::io(format!("open update lock '{}'", lock_path.display()), error)
+            })?;
+        file.try_lock_exclusive().map_err(|error| {
+            let message = if error.kind() == io::ErrorKind::WouldBlock {
+                "another packctl update or rollback is already running".to_string()
+            } else {
+                format!("lock update operation: {error}")
+            };
+            PackError::State(message)
+        })?;
+        Ok(ServerLock { file })
+    }
+
     /// Persists `state` atomically.
     ///
     /// Parent directories are created first, then the JSON is written to a
@@ -105,17 +153,43 @@ impl StateStore {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "state.json".to_string());
-        let tmp = self
-            .path
-            .with_file_name(format!(".{}.{}.tmp", file_name, std::process::id()));
-        std::fs::write(&tmp, json).map_err(|e| {
-            PackError::io(format!("write temporary state file '{}'", tmp.display()), e)
-        })?;
-        std::fs::rename(&tmp, &self.path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            PackError::io(format!("replace state file '{}'", self.path.display()), e)
-        })?;
-        Ok(())
+        for counter in 0u32.. {
+            let tmp = self.path.with_file_name(format!(
+                ".{}.{}.{}.tmp",
+                file_name,
+                std::process::id(),
+                counter
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    if let Err(error) = file
+                        .write_all(&json)
+                        .and_then(|_| file.sync_all())
+                        .and_then(|_| std::fs::rename(&tmp, &self.path))
+                    {
+                        let _ = std::fs::remove_file(&tmp);
+                        return Err(PackError::io(
+                            format!("replace state file '{}'", self.path.display()),
+                            error,
+                        ));
+                    }
+                    return Ok(());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(PackError::io(
+                        format!("create temporary state file '{}'", tmp.display()),
+                        error,
+                    ));
+                }
+            }
+        }
+        unreachable!()
     }
 }
 
@@ -242,5 +316,27 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+    }
+
+    #[test]
+    fn save_avoids_existing_temporary_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::at(dir.path()).unwrap();
+        std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
+        let collision = store
+            .path
+            .with_file_name(format!(".state.json.{}.0.tmp", std::process::id()));
+        std::fs::write(&collision, b"other writer").unwrap();
+        store.save(&full_state()).unwrap();
+        assert_eq!(std::fs::read(&collision).unwrap(), b"other writer");
+        assert_eq!(store.load().unwrap(), full_state());
+    }
+
+    #[test]
+    fn lock_rejects_concurrent_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::at(dir.path()).unwrap();
+        let _first = store.lock().unwrap();
+        assert!(matches!(store.lock(), Err(PackError::State(_))));
     }
 }

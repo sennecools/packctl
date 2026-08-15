@@ -5,6 +5,7 @@
 //! and restarted afterwards (see design notes "Rollback").
 
 use crate::core::snapshot::{list_snapshots, restore_snapshot};
+use crate::core::state::StateStore;
 use crate::core::updater::Updater;
 use crate::error::{PackError, Result};
 
@@ -12,6 +13,7 @@ use crate::error::{PackError, Result};
 pub async fn run(server: Option<&str>) -> Result<()> {
     let profile = crate::config::profile::resolve_profile(server)?;
     let updater = Updater::from_profile(&profile)?;
+    let _lock = StateStore::at(&profile.server.root)?.lock()?;
 
     let snapshots = list_snapshots(&profile.server.root)?;
     let latest = match snapshots.first() {
