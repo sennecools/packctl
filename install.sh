@@ -17,8 +17,7 @@ set -eu
 
 REPO="${PACKCTL_REPO:-sennecools/packctl}"
 VERSION="${1:-${VERSION:-latest}}"
-shift 2>/dev/null || true
-INSTALL_DIR="${1:-${INSTALL_DIR:-}}"
+INSTALL_DIR="${2:-${INSTALL_DIR:-}}"
 
 say() { printf 'packctl: %s\n' "$*"; }
 die() { say "$*" >&2; exit 1; }
@@ -73,7 +72,7 @@ have sha256sum || die "sha256sum is required to verify the download"
 curl -fsSL "$base_url/SHA256SUMS" -o "$tmpdir/SHA256SUMS" \
   || die "could not download release checksums"
 expected="$(sed -n "s/^\\([0-9a-f]\\{64\\}\\)  $archive$/\\1/p" "$tmpdir/SHA256SUMS")"
-[ -n "$expected" ] && [ "$(printf '%s\\n' "$expected" | wc -l)" -eq 1 ] \
+[ -n "$expected" ] && [ "$(printf '%s\n' "$expected" | wc -l)" -eq 1 ] \
   || die "no exact SHA-256 checksum found for $archive"
 actual="$(sha256sum "$tmpdir/$archive")"
 actual="${actual%% *}"
