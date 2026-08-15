@@ -82,11 +82,15 @@ impl AmpController {
         ))
     }
 
-    /// `ampinstmgr status <instance>`
+    /// `ampinstmgr ShowInstanceInfo <instance>`
+    ///
+    /// `ShowInstanceInfo` reports a single instance with an explicit
+    /// `Running │ Yes/No` field, unlike the status table whose rows truncate
+    /// instance names.
     fn status_args(&self) -> Vec<String> {
         vec![
             self.ampinstmgr.clone(),
-            "status".into(),
+            "ShowInstanceInfo".into(),
             self.instance.clone(),
         ]
     }
@@ -144,12 +148,28 @@ impl AmpController {
     }
 }
 
-/// Map `ampinstmgr status` output to a [`ServerStatus`].
+/// Map `ampinstmgr` status output to a [`ServerStatus`].
 ///
-/// AMP's status output is human-oriented text, so matching is substring-based
-/// and case-insensitive.
+/// AMP's output is human-oriented text, so matching is substring-based and
+/// case-insensitive. `ShowInstanceInfo` (and the status table) marks the
+/// instance state with a `Running │ Yes/No` field, which is authoritative;
+/// word-based output ("running"/"stopped") is matched as a fallback.
 fn parse_status_output(output: &str) -> ServerStatus {
     let text = output.to_lowercase();
+
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("running") else {
+            continue;
+        };
+        let value = rest
+            .trim_start_matches(|c: char| c == '│' || c == '|' || c == ':' || c.is_whitespace());
+        match value.trim() {
+            "yes" => return ServerStatus::Running,
+            "no" => return ServerStatus::Stopped,
+            _ => {}
+        }
+    }
+
     if text.contains("running") {
         ServerStatus::Running
     } else if text.contains("stopped") {
@@ -259,8 +279,8 @@ mod tests {
             "ampinstmgr",
             &format!(
                 "case \"$1\" in\n\
-                 status)\n  \
-                   if [ -f {} ]; then echo \"Instance is running\"; else echo \"Instance is stopped\"; fi\n\
+                 ShowInstanceInfo)\n  \
+                   if [ -f {} ]; then echo \"Running            │ Yes\"; else echo \"Running            │ No\"; fi\n\
                    exit 0 ;;\n\
                  stop)\n  \
                    rm -f {}; echo \"Stopping instance...\"; exit 0 ;;\n\
@@ -285,10 +305,10 @@ mod tests {
     }
 
     #[test]
-    fn status_args_are_amp_status() {
+    fn status_args_are_amp_show_instance_info() {
         assert_eq!(
             controller().status_args(),
-            ["ampinstmgr", "status", "ATM10"]
+            ["ampinstmgr", "ShowInstanceInfo", "ATM10"]
         );
     }
 
@@ -312,7 +332,7 @@ mod tests {
         assert_eq!(ctrl.timeout_ms, 5_000);
         assert_eq!(
             ctrl.status_args(),
-            ["/opt/amp/ampinstmgr", "status", "ATM10"]
+            ["/opt/amp/ampinstmgr", "ShowInstanceInfo", "ATM10"]
         );
     }
 
@@ -339,6 +359,22 @@ mod tests {
             parse_status_output("Instance is restarting"),
             ServerStatus::Unknown
         );
+    }
+
+    #[test]
+    fn parse_status_output_reads_show_instance_info_field() {
+        let running = "Instance ID        │ 10c567e9-d9b2-4436-a978-5189003dce8f\n\
+                       Module             │ Minecraft\n\
+                       Instance Name      │ AlltheMods10Season301\n\
+                       Running            │ Yes\n\
+                       Runs in Container  │ Yes";
+        let stopped = "Instance Name      │ Minecraft01\n\
+                       Running            │ No\n\
+                       Data Path          │ /home/amp/.ampdata/instances/Minecraft01";
+        assert_eq!(parse_status_output(running), ServerStatus::Running);
+        assert_eq!(parse_status_output(stopped), ServerStatus::Stopped);
+        assert_eq!(parse_status_output("Running: Yes"), ServerStatus::Running);
+        assert_eq!(parse_status_output("Running: No"), ServerStatus::Stopped);
     }
 
     #[test]
