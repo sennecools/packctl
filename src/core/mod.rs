@@ -5,6 +5,7 @@
 //! knows how CurseForge, AMP, or any other integration works.
 
 pub mod executor;
+pub mod ignore;
 pub mod overlay;
 pub mod ownership;
 pub mod planner;

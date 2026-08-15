@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::core::ignore::IgnoreRules;
 use crate::core::overlay::OverlayFile;
 use crate::core::ownership::FilePolicy;
 use crate::core::state::InstalledState;
@@ -120,11 +121,22 @@ impl UpdatePlan {
 /// Builds [`UpdatePlan`]s from installed state, prepared upstream, and overlay.
 pub struct UpdatePlanner {
     pub policy: FilePolicy,
+    pub ignore: IgnoreRules,
 }
 
 impl UpdatePlanner {
     pub fn new(policy: FilePolicy) -> Self {
-        UpdatePlanner { policy }
+        UpdatePlanner {
+            policy,
+            ignore: IgnoreRules::default(),
+        }
+    }
+
+    /// Restricts the plan with `.packctlignore` rules: matched paths are never
+    /// removed by the sweep and never updated from the upstream pack.
+    pub fn with_ignore(mut self, ignore: IgnoreRules) -> Self {
+        self.ignore = ignore;
+        self
     }
 
     /// Conservative plan that treats the recorded managed state as the only
@@ -163,7 +175,13 @@ impl UpdatePlanner {
     ) -> Result<UpdatePlan> {
         let mut live = Vec::new();
         for dir in pack_owned_dirs(desired) {
-            collect_live_files(server_root, Path::new(&dir), &self.policy, &mut live)?;
+            collect_live_files(
+                server_root,
+                Path::new(&dir),
+                &self.policy,
+                &self.ignore,
+                &mut live,
+            )?;
         }
         self.build_plan_with_inputs(from, desired, overlay, &live, Some(server_root))
     }
@@ -205,6 +223,9 @@ impl UpdatePlanner {
             if self.policy.is_persistent(rel) {
                 continue;
             }
+            if self.ignore.is_ignored(rel) {
+                continue;
+            }
             let key = rel_key(rel);
             if overlay_files.contains_key(&key) {
                 continue;
@@ -227,6 +248,9 @@ impl UpdatePlanner {
         for (path, desired_file) in &desired_files {
             let rel = Path::new(path);
             if self.policy.is_persistent(rel) {
+                continue;
+            }
+            if self.ignore.is_ignored(rel) {
                 continue;
             }
             if overlay_files.contains_key(path) {
@@ -352,11 +376,13 @@ fn pack_owned_dirs(desired: &PreparedPack) -> Vec<String> {
 /// Symlinks are never followed (and never returned), so a destructive sweep
 /// cannot cross or remove them. Persistent subtrees are skipped entirely so a
 /// `world/` or `logs/` living under a pack-owned folder is never walked or
-/// removed.
+/// removed. Ignored subtrees are skipped too, so `.packctlignore` rules
+/// protect runtime data without it ever entering the plan.
 fn collect_live_files(
     root: &Path,
     rel_dir: &Path,
     policy: &FilePolicy,
+    ignore: &IgnoreRules,
     out: &mut Vec<PathBuf>,
 ) -> Result<()> {
     let dir = if rel_dir.as_os_str().is_empty() {
@@ -385,12 +411,12 @@ fn collect_live_files(
             continue;
         }
         if metadata.is_dir() {
-            if !policy.is_persistent(&rel) {
-                collect_live_files(root, &rel, policy, out)?;
+            if !policy.is_persistent(&rel) && !ignore.is_ignored(&rel) {
+                collect_live_files(root, &rel, policy, ignore, out)?;
             }
             continue;
         }
-        if metadata.is_file() {
+        if metadata.is_file() && !ignore.is_ignored(&rel) {
             out.push(rel);
         }
     }
@@ -441,6 +467,7 @@ fn conflict_notice(rel_path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ignore::parse_rules;
     use crate::core::state::ManagedFile;
     use crate::providers::PackVersion;
 
@@ -1081,5 +1108,61 @@ mod tests {
 
         assert_eq!(rels(&plan.removals), Vec::<PathBuf>::new());
         assert_eq!(rels(&plan.additions), vec![PathBuf::from("mods/a.jar")]);
+    }
+
+    #[test]
+    fn ignored_paths_are_never_swept_or_updated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("server");
+        write(&root, "config/luckperms/luckperms-h2-v2.mv.db", b"data");
+        write(&root, "config/luckperms/luckperms.conf", b"tuned");
+        write(&root, "config/jei-server.toml", b"runtime");
+        write(&root, "config/mod.toml", b"pack-shipped");
+
+        let desired = pack(
+            "1",
+            "id-1",
+            vec![
+                staged("config/mod.toml", "pack-new"),
+                staged("config/luckperms/luckperms.conf", "pack-version"),
+            ],
+        );
+        let ignore = parse_rules("config/luckperms\nconfig/jei-server.toml\n").unwrap();
+
+        let plan = UpdatePlanner::new(FilePolicy::default_policy())
+            .with_ignore(ignore)
+            .build_plan_for_server(&InstalledState::default(), &desired, &[], &root)
+            .unwrap();
+
+        let paths = plan_paths(&plan);
+        assert!(!paths.contains(&PathBuf::from("config/luckperms/luckperms-h2-v2.mv.db")));
+        assert!(!paths.contains(&PathBuf::from("config/luckperms/luckperms.conf")));
+        assert!(!paths.contains(&PathBuf::from("config/jei-server.toml")));
+        assert!(paths.contains(&PathBuf::from("config/mod.toml")));
+    }
+
+    #[test]
+    fn overlay_still_applies_to_ignored_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("server");
+        write(&root, "config/luckperms/luckperms.conf", b"runtime");
+        write(&root, "config/mod.toml", b"pack");
+
+        let desired = pack("1", "id-1", vec![staged("config/mod.toml", "pack-new")]);
+        let overlay = vec![overlay_file("config/luckperms/luckperms.conf", "overlay")];
+        let ignore = parse_rules("config/luckperms\n").unwrap();
+
+        let plan = UpdatePlanner::new(FilePolicy::default_policy())
+            .with_ignore(ignore)
+            .build_plan_for_server(&InstalledState::default(), &desired, &overlay, &root)
+            .unwrap();
+
+        assert!(
+            plan.overlay_changes
+                .iter()
+                .any(|c| c.rel_path == *"config/luckperms/luckperms.conf"),
+            "overlay content must still apply even when the path is ignored"
+        );
+        assert!(!rels(&plan.removals).contains(&PathBuf::from("config/luckperms/luckperms.conf")));
     }
 }

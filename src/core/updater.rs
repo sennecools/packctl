@@ -22,6 +22,7 @@ use chrono::Utc;
 use crate::config::profile::{DEFAULT_DROP_DIR, ProviderKind, ServerProfile};
 use crate::controllers::ServerController;
 use crate::core::executor::UpdateExecutor;
+use crate::core::ignore::IgnoreRules;
 use crate::core::overlay::{OverlayEngine, OverlayFile};
 use crate::core::ownership::FilePolicy;
 use crate::core::planner::{UpdatePlan, UpdatePlanner};
@@ -127,12 +128,10 @@ impl Updater {
         let staging = StagingDir::create_default()?;
         let prepared = self.provider.prepare(&resolved, &staging.root).await?;
         let overlay_files = OverlayEngine::new(self.profile.overlay.path.clone()).scan()?;
-        let plan = UpdatePlanner::new(FilePolicy::default_policy()).build_plan_for_server(
-            &state,
-            &prepared,
-            &overlay_files,
-            &self.profile.server.root,
-        )?;
+        let ignore = load_ignore_rules(&self.profile.server.root)?;
+        let plan = UpdatePlanner::new(FilePolicy::default_policy())
+            .with_ignore(ignore)
+            .build_plan_for_server(&state, &prepared, &overlay_files, &self.profile.server.root)?;
         Ok(PreparedUpdate {
             overlay_files,
             plan,
@@ -237,6 +236,22 @@ impl Updater {
 
 /// Relative path of the state file inside the server root.
 const STATE_REL_PATH: &str = ".packctl/state.json";
+
+/// Name of the `.gitignore`-style file that excludes paths from updates.
+const IGNORE_FILE: &str = ".packctlignore";
+
+/// Loads the `.packctlignore` rules from the server root, if present.
+///
+/// A missing file means no ignore rules; an unparsable file is a hard error so
+/// a typo can never silently widen the sweep.
+fn load_ignore_rules(server_root: &Path) -> Result<IgnoreRules> {
+    let path = server_root.join(IGNORE_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => crate::core::ignore::parse_rules(&content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(IgnoreRules::default()),
+        Err(error) => Err(PackError::io(format!("read '{}'", path.display()), error)),
+    }
+}
 
 /// Creates the rollback snapshot covering every path the plan touches.
 ///
@@ -758,6 +773,50 @@ mod tests {
         assert_eq!(
             std::fs::read(server_root.join("world/region/r.mca")).unwrap(),
             b"world"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_update_respects_packctlignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server_root = tmp.path().join("server");
+        std::fs::create_dir_all(server_root.join("mods")).unwrap();
+        std::fs::write(server_root.join("mods/stale-old.jar"), b"old").unwrap();
+        std::fs::write(server_root.join("mods/custom-kept.jar"), b"keep").unwrap();
+        std::fs::write(
+            server_root.join(".packctlignore"),
+            b"mods/custom-kept.jar\n",
+        )
+        .unwrap();
+
+        let overlay = tmp.path().join("overlay");
+        let profile = profile(&server_root, &overlay);
+        let updater = Updater::new(
+            profile,
+            Box::new(FakeProvider),
+            Box::new(FakeController::new()),
+        );
+
+        let prepared = updater
+            .prepare_update(&VersionSelector::Latest)
+            .await
+            .unwrap();
+
+        assert!(
+            prepared
+                .plan
+                .removals
+                .iter()
+                .any(|c| c.rel_path == *"mods/stale-old.jar"),
+            "unignored stale file must be planned for removal"
+        );
+        assert!(
+            !prepared
+                .plan
+                .removals
+                .iter()
+                .any(|c| c.rel_path == *"mods/custom-kept.jar"),
+            "ignored file must not be planned for removal"
         );
     }
 

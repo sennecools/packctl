@@ -49,7 +49,7 @@ The pack-owned folders are kept **in sync** with the selected version: each top-
 ### What `packctl` deliberately does not do
 
 - **No config merging.** There is no "smart" merge of TOML, JSON, YAML, SNBT, KubeJS, or properties files. The model is upstream first, overlay second.
-- **Only pack-owned folders are swept.** Files are removed only inside folders the new pack ships, and only when they are neither part of the new pack nor provided by the overlay. Anything dropped directly into those folders without the overlay is removed on the next update — that is the trade-off for always staying in sync, and why your custom files belong in the overlay.
+- **Only pack-owned folders are swept.** Files are removed only inside folders the new pack ships, and only when they are neither part of the new pack nor provided by the overlay. Anything dropped directly into those folders without the overlay is removed on the next update — that is the trade-off for always staying in sync, and why your custom files belong in the overlay. Use a `.packctlignore` file to protect runtime data (permission databases, regenerated configs, and so on).
 - **Everything outside the pack's folders is never touched.** `libraries/`, `world/`, `logs/`, `backups/`, AMP/runtime files, and any folder the pack does not ship are never swept. Persistent runtime data (`world/` and the paths below) is excluded from the plan entirely, even if a pack ships it.
 - It is not a launcher, a modpack authoring tool, a generic mod updater, a hosting panel, a world backup system, or a replacement for AMP. It manages safe upstream modpack upgrades for self-hosted servers.
 
@@ -311,6 +311,20 @@ This is informational, not an error. `server.properties` is persistent by defaul
 
 Because pack-owned folders are swept to match the pack, a file dropped **directly** into a pack folder (without also placing it in the overlay) is removed on the next update. Your custom mods, configs, KubeJS scripts, datapacks, and so on must live in the overlay. The `overlay/` and `packs/` folders themselves are never swept.
 
+## `.packctlignore` — protecting runtime data
+
+Mods write runtime data inside pack-owned folders: permission plugins keep their database under `config/`, some mods regenerate config files on first boot, and a hosting panel may manage `jre/`. The full sweep would remove all of that on every update. Add a `.packctlignore` file in the server root to exclude paths — a gitignore-style list of paths packctl must never touch (they are neither removed by the sweep nor updated from the pack):
+
+```text
+# comments and blank lines are ignored
+config/luckperms/              # the whole directory tree
+defaultconfigs/ftbranks/
+config/*.bak                   # * matches within one segment
+**/tmp                         # ** matches across segments
+```
+
+A pattern matches the named path and, when it names a directory, everything beneath it. `*` and `?` match within a single path segment, `**` matches across segments; patterns are anchored to the server root. The overlay is still applied to an ignored path if the overlay contains it. Negation (`!`) is not supported.
+
 ## Persistent runtime data
 
 The updater never plans changes for these paths, even when a new modpack version ships them:
@@ -355,7 +369,7 @@ Safety is the top priority. The guarantees:
 - **Snapshot before mutation** — before any live file changes, the exact files the plan touches are copied to `server_root/.packctl/snapshots/<timestamp>/` along with a manifest and the previous `state.json`.
 - **Commit state last** — the new version is recorded only after files, overlay, and validation all succeeded. A failed update never leaves state claiming the new version is installed.
 - **Pack-owned folders are kept in sync** — every top-level folder the selected version ships is swept so it ends up exactly equal to the new pack plus the overlay. Stale files from an earlier version are removed even on the first update; this is what makes an unmanaged server converge onto the pack.
-- **Removals are scoped and protected** — a file is only removed inside a pack-owned folder, and only when it is not part of the new pack, not persistent, and not overlay-provided. Persistent runtime data and folders the pack does not ship never enter the plan, even when a pack ships the same path (`world/` and the others below are excluded entirely).
+- **Removals are scoped and protected** — a file is only removed inside a pack-owned folder, and only when it is not part of the new pack, not persistent, not overlay-provided, and not matched by `.packctlignore`. Persistent runtime data and folders the pack does not ship never enter the plan, even when a pack ships the same path (`world/` and the others below are excluded entirely).
 - **Path safety** — archive, provider, config, and overlay paths are treated as untrusted. Traversal (`..`), absolute paths, empty components, and NUL bytes are rejected, and symlinks are not followed during destructive operations.
 - **No-op plans do nothing** — if the plan is empty, the server is not stopped, nothing is snapshotted, and nothing is committed.
 
