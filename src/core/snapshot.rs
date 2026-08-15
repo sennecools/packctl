@@ -75,9 +75,19 @@ pub fn create_snapshot(
 ) -> Result<Snapshot> {
     let created = Utc::now();
     let snapshots_root = server_root.join(".packctl").join("snapshots");
-    let dir = unique_snapshot_dir(&snapshots_root, created);
-    std::fs::create_dir_all(dir.join("files"))
-        .map_err(|e| PackError::io(format!("create snapshot directory '{}'", dir.display()), e))?;
+    let dir = create_unique_snapshot_dir(&snapshots_root, created)?;
+    std::fs::create_dir(dir.join("files")).map_err(|e| {
+        PackError::io(
+            format!("create snapshot files directory '{}'", dir.display()),
+            e,
+        )
+    })?;
+
+    // Validate every source before creating partial snapshot contents.
+    for file in files {
+        let rel = strip_server_root(server_root, file)?;
+        reject_symlink_components(server_root, &server_root.join(rel))?;
+    }
 
     let mut manifest_files = HashMap::new();
     for file in files {
@@ -139,6 +149,25 @@ pub fn restore_snapshot(server_root: &Path, snapshot: &Snapshot) -> Result<()> {
     let manifest = load_manifest(&snapshot.dir)?;
     let files_root = snapshot.dir.join("files");
 
+    // Check all restore sources and destinations before deleting newly-added files.
+    for tracked in &manifest.tracked_paths {
+        let target = safe_join(server_root, Path::new(tracked))?;
+        reject_symlink_components(server_root, &target)?;
+    }
+    for rel in manifest.files.keys() {
+        let source = files_root.join(rel_path_from_string(rel));
+        if !source.is_file() {
+            return Err(PackError::State(format!(
+                "snapshot '{}' is missing restore file '{}'",
+                snapshot.dir.display(),
+                rel
+            )));
+        }
+        reject_symlink_components(&files_root, &source)?;
+        let target = safe_join(server_root, Path::new(rel))?;
+        reject_symlink_components(server_root, &target)?;
+    }
+
     for tracked in &manifest.tracked_paths {
         if !manifest.files.contains_key(tracked) {
             let target = safe_join(server_root, Path::new(tracked))?;
@@ -148,13 +177,6 @@ pub fn restore_snapshot(server_root: &Path, snapshot: &Snapshot) -> Result<()> {
 
     for rel in manifest.files.keys() {
         let source = files_root.join(rel_path_from_string(rel));
-        if !source.exists() {
-            return Err(PackError::State(format!(
-                "snapshot '{}' is missing restore file '{}'",
-                snapshot.dir.display(),
-                rel
-            )));
-        }
         let target = safe_join(server_root, Path::new(rel))?;
         copy_file(&source, &target)?;
     }
@@ -248,28 +270,110 @@ fn write_manifest(dir: &Path, manifest: &SnapshotManifest) -> Result<()> {
             path.display()
         ))
     })?;
-    std::fs::write(&path, json)
-        .map_err(|e| PackError::io(format!("write snapshot manifest '{}'", path.display()), e))
+    atomic_write(&path, &json, "snapshot manifest")
 }
 
 /// Chooses a snapshot directory name based on `created`.
 ///
 /// The timestamp format truncates to seconds; on the rare collision the name
 /// gets a short counter suffix.
-fn unique_snapshot_dir(snapshots_root: &Path, created: DateTime<Utc>) -> PathBuf {
+fn create_unique_snapshot_dir(snapshots_root: &Path, created: DateTime<Utc>) -> Result<PathBuf> {
+    std::fs::create_dir_all(snapshots_root).map_err(|e| {
+        PackError::io(
+            format!("create snapshots directory '{}'", snapshots_root.display()),
+            e,
+        )
+    })?;
     let stamp = created.format(SNAPSHOT_STAMP_FORMAT).to_string();
-    let base = snapshots_root.join(&stamp);
-    if !base.exists() {
-        return base;
-    }
-    let mut counter = 1u32;
+    let mut counter = 0u32;
     loop {
-        let candidate = snapshots_root.join(format!("{stamp}-{counter}"));
-        if !candidate.exists() {
-            return candidate;
+        let name = if counter == 0 {
+            stamp.clone()
+        } else {
+            format!("{stamp}-{counter}")
+        };
+        let candidate = snapshots_root.join(name);
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => counter += 1,
+            Err(error) => {
+                return Err(PackError::io(
+                    format!("create snapshot directory '{}'", candidate.display()),
+                    error,
+                ));
+            }
         }
-        counter += 1;
     }
+}
+
+fn atomic_write(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| PackError::State(format!("{label} has no parent: '{}'", path.display())))?;
+    for counter in 0u32.. {
+        let tmp = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            path.file_name().unwrap().to_string_lossy(),
+            std::process::id(),
+            counter
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                if let Err(error) = file
+                    .write_all(bytes)
+                    .and_then(|_| file.sync_all())
+                    .and_then(|_| std::fs::rename(&tmp, path))
+                {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(PackError::io(
+                        format!("write {label} '{}'", path.display()),
+                        error,
+                    ));
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(PackError::io(
+                    format!("create temporary {label} '{}'", tmp.display()),
+                    error,
+                ));
+            }
+        }
+    }
+    unreachable!()
+}
+
+fn reject_symlink_components(root: &Path, path: &Path) -> Result<()> {
+    let rel = path
+        .strip_prefix(root)
+        .map_err(|_| PackError::UnsafePath(path.to_path_buf()))?;
+    let mut current = root.to_path_buf();
+    for component in rel.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(PackError::UnsafePathComponent {
+                    path: path.to_path_buf(),
+                    component: current.display().to_string(),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(PackError::io(
+                    format!("stat '{}'", current.display()),
+                    error,
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Rebuilds a relative path from a forward-slash string.
@@ -465,6 +569,31 @@ mod tests {
             std::fs::read(root.join("mods/a.jar")).unwrap(),
             b"AAAA",
             "restore must trust the manifest on disk, not the in-memory copy"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_rejects_symlink_target_before_deleting_additions() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = make_server(&tmp);
+        let paths = [root.join("mods/a.jar"), root.join("mods/new.jar")];
+        let snap = create_snapshot(
+            &root,
+            &paths_as_ref(&paths),
+            &["mods/a.jar", "mods/new.jar"],
+        )
+        .unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::remove_dir_all(root.join("mods")).unwrap();
+        symlink(&outside, root.join("mods")).unwrap();
+        std::fs::write(outside.join("new.jar"), b"must remain").unwrap();
+        assert!(restore_snapshot(&root, &snap).is_err());
+        assert_eq!(
+            std::fs::read(outside.join("new.jar")).unwrap(),
+            b"must remain"
         );
     }
 }
