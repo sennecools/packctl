@@ -68,14 +68,17 @@ trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
 say "downloading $VERSION ($target)..."
 curl -fsSL "$base_url/$archive" -o "$tmpdir/$archive"
 
-# --- verify checksum when published ---
-if have sha256sum; then
-  if curl -fsSL "$base_url/SHA256SUMS" -o "$tmpdir/SHA256SUMS" 2>/dev/null; then
-    (cd "$tmpdir" && sha256sum -c --ignore-missing SHA256SUMS >/dev/null) \
-      || die "checksum verification failed for $archive"
-    say "checksum verified"
-  fi
-fi
+# --- verify checksum ---
+have sha256sum || die "sha256sum is required to verify the download"
+curl -fsSL "$base_url/SHA256SUMS" -o "$tmpdir/SHA256SUMS" \
+  || die "could not download release checksums"
+expected="$(sed -n "s/^\\([0-9a-f]\\{64\\}\\)  $archive$/\\1/p" "$tmpdir/SHA256SUMS")"
+[ -n "$expected" ] && [ "$(printf '%s\\n' "$expected" | wc -l)" -eq 1 ] \
+  || die "no exact SHA-256 checksum found for $archive"
+actual="$(sha256sum "$tmpdir/$archive")"
+actual="${actual%% *}"
+[ "$actual" = "$expected" ] || die "checksum verification failed for $archive"
+say "checksum verified"
 
 tar -xzf "$tmpdir/$archive" -C "$tmpdir"
 

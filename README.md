@@ -88,8 +88,8 @@ sudo install -m 0755 target/release/packctl /usr/local/bin/packctl
 ```
 
 The CurseForge API requires a free API key. `packctl` reads it from the
-`CF_API_KEY` environment variable and never writes it to logs or state. Get one
-(one-time, free) at <https://console.curseforge.com/>:
+`CF_API_KEY` environment variable and never writes it in plaintext to logs or
+state. Get one (one-time, free) at <https://console.curseforge.com/>:
 
 ```bash
 export CF_API_KEY="..."
@@ -175,9 +175,11 @@ packctl create atm10 --source 925200 --apikey "$CF_API_KEY" \
 The CurseForge API requires a free key (<https://console.curseforge.com/>).
 `packctl` reads it from `$CF_API_KEY` if set, otherwise from the profile. When
 you store it in the profile it is **encrypted at rest** with AES-256-GCM; the
-per-user decryption key lives in `~/.config/packctl/.key` (0600), never inside
-the server root, so a plain API key is not readable from backups or control
-panels. Manage it with:
+per-user decryption key lives in `$PACKCTL_HOME/.key`, or otherwise
+`$XDG_CONFIG_HOME/packctl/.key` (default `~/.config/packctl/.key`), with mode
+0600 on Unix. It is never inside the server root unless you explicitly point
+`PACKCTL_HOME` there, so a plain API key is not readable from backups or
+control panels. Manage it with:
 
 ```bash
 packctl apikey            # prompt to store a key
@@ -217,7 +219,7 @@ overrides the display name. A complete commented example lives at
 
 ### Controllers
 
-- **AMP** (`type = "amp"`): drives the CubeCoders `ampinstmgr` CLI for the named instance. `stop` uses `--wait` and confirms the instance actually stopped before continuing.
+- **AMP** (`type = "amp"`): drives the CubeCoders `ampinstmgr` CLI for the named instance. `stop` uses `--wait` and confirms the instance actually reports `stopped` before continuing. If present, `controller.command.timeout_ms` also bounds AMP calls; otherwise the default is 120000 ms.
 - **Command** (`type = "command"`): runs the `status`/`stop`/`start` argv arrays directly — never through a shell. Each invocation is bounded by `timeout_ms` (default 120000 ms). A `status` command is expected to exit `0` when running and `1` when stopped.
 
 ## The overlay
