@@ -106,6 +106,10 @@ pub enum Command {
         /// Remove the stored API key
         #[arg(long)]
         remove: bool,
+        /// Manage the shared, machine-wide key used by every profile instead of
+        /// a per-server key
+        #[arg(long)]
+        global: bool,
     },
     /// List available upstream versions for a server
     Versions {
@@ -202,7 +206,8 @@ pub async fn run() -> Result<()> {
             server,
             set,
             remove,
-        } => apikey::run(server.as_deref(), set, remove).await,
+            global,
+        } => apikey::run(server.as_deref(), set, remove, global).await,
         Command::Versions { server, json } => versions::run(server.as_deref(), json).await,
         Command::Plan {
             server,

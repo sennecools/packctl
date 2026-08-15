@@ -191,6 +191,19 @@ The master key is created the first time you store a secret. Because it
 protects only against *file readers* — anyone with shell access as your user
 can read the `.key` file — the decrypted key never appears in logs or output.
 
+**One key for every server.** Instead of storing a key per profile, store it
+once as a shared, machine-wide key and every profile uses it unless it has its
+own:
+
+```bash
+packctl apikey --global --set "..."
+packctl apikey --global --remove
+```
+
+Resolution order per profile: `CF_API_KEY` env var → key stored in the profile
+→ shared global key → error. So a single CurseForge API key (the server
+administrator's) covers all instances on the machine; nobody else needs one.
+
 ### Global profiles
 
 If you prefer one profile directory for many servers, pass `--global` to
@@ -316,7 +329,7 @@ Everything else under the server root is treated as updater-managed content.
 | `packctl list` | List configured server profiles. |
 | `packctl create <server> [--source <url\|id\|slug>] [--provider <curseforge\|local>] [--archive <path>] [--apikey <key>] [--global] ...` | Interactively create a server profile. Defaults to a local `.packctl.toml` in the current directory; `--global` writes to the profile directory instead. `--provider local --archive <path>` follows a local server-pack zip (no API key needed). `-n`/`--non-interactive` requires every value as a flag; `-f`/`--force` overwrites. |
 | `packctl status <server>` | Show installed version, last update, managed-file count, snapshot count, and controller status. Local only, no network. |
-| `packctl apikey <server> [--set <key>] [--remove]` | Store, show, or remove the encrypted CurseForge API key. |
+| `packctl apikey <server> [--set <key>] [--remove] [--global]` | Store, show, or remove the encrypted CurseForge API key. `--global` stores one shared key used by every profile instead of a per-server key. |
 | `packctl versions <server> [--json]` | List available upstream versions. `-j`/`--json` prints an array of `{id, name, released}`. |
 | `packctl plan <server> [version] [--verbose]` | Preview an update without changing anything. `-v`/`--verbose` lists every file. |
 | `packctl update <server> [version] [--non-interactive] [--verbose]` | Apply an update. Interactive prompts select the version (when omitted) and confirm before applying. |

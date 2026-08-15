@@ -96,7 +96,9 @@ impl ServerProfile {
     /// The CurseForge API key to use for this profile.
     ///
     /// `$CF_API_KEY` wins when set; otherwise the profile's stored, encrypted
-    /// key is decrypted. Returns `Ok(None)` when no key is available.
+    /// key is decrypted; otherwise the shared, machine-wide key stored with
+    /// `packctl apikey --global` is used. Returns `Ok(None)` when no key is
+    /// available.
     pub fn curseforge_api_key(&self) -> Result<Option<String>> {
         let from_env = std::env::var("CF_API_KEY")
             .ok()
@@ -104,10 +106,10 @@ impl ServerProfile {
         if let Some(key) = from_env {
             return Ok(Some(key));
         }
-        match &self.secrets.api_key {
-            Some(blob) => crate::config::secrets::decrypt_string(blob).map(Some),
-            None => Ok(None),
+        if let Some(blob) = &self.secrets.api_key {
+            return crate::config::secrets::decrypt_string(blob).map(Some);
         }
+        crate::config::secrets::load_global_key()
     }
 }
 
@@ -1349,6 +1351,58 @@ timeout_ms = 30000
         let _key_guard = EnvGuard::set("CF_API_KEY", std::ffi::OsStr::new("env-key"));
         assert_eq!(
             profile.curseforge_api_key().unwrap().as_deref(),
+            Some("env-key")
+        );
+    }
+
+    #[test]
+    fn curseforge_api_key_falls_back_to_shared_global_key() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("PACKCTL_HOME", dir.path().as_os_str());
+
+        let draft = ProfileDraft {
+            name: "atm10".to_string(),
+            server_root: PathBuf::from("/srv/atm10"),
+            provider: ProviderKind::CurseForge,
+            project_id: 1,
+            slug: None,
+            archive: None,
+            overlay_path: PathBuf::from("/srv/atm10/overlay"),
+            controller: ControllerKind::Amp,
+            instance: Some("x".to_string()),
+            command: None,
+            secrets: None,
+        };
+        write_profile(&draft, false).unwrap();
+        let profile = load_profile("atm10").unwrap();
+
+        // No key anywhere yet.
+        assert_eq!(profile.curseforge_api_key().unwrap(), None);
+
+        // A shared global key covers a profile without its own key.
+        crate::config::secrets::store_global_key("global-key").unwrap();
+        assert_eq!(
+            profile.curseforge_api_key().unwrap().as_deref(),
+            Some("global-key")
+        );
+
+        // A per-profile key wins over the shared key.
+        let with_own = ServerProfile {
+            secrets: SecretsSection {
+                api_key: Some(crate::config::secrets::encrypt_string("profile-key").unwrap()),
+            },
+            ..profile
+        };
+        assert_eq!(
+            with_own.curseforge_api_key().unwrap().as_deref(),
+            Some("profile-key")
+        );
+
+        // The environment still wins over everything.
+        let _key_guard = EnvGuard::set("CF_API_KEY", std::ffi::OsStr::new("env-key"));
+        assert_eq!(
+            with_own.curseforge_api_key().unwrap().as_deref(),
             Some("env-key")
         );
     }

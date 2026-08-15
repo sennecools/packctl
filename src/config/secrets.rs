@@ -23,6 +23,11 @@ use base64::Engine;
 use crate::error::{PackError, Result};
 
 const KEY_FILE_NAME: &str = ".key";
+/// File name of the shared, machine-wide API key blob in the config directory.
+///
+/// Unlike a per-profile key, this one is stored once and used by every profile
+/// on the machine, so a single CurseForge API key covers all servers.
+const GLOBAL_KEY_FILE_NAME: &str = "apikey";
 /// Version prefix on stored blobs so the format can evolve.
 const BLOB_PREFIX: &str = "v1:";
 const NONCE_LEN: usize = 12;
@@ -31,6 +36,38 @@ const KEY_LEN: usize = 32;
 /// Path of the per-user master key file.
 pub fn key_file_path() -> Result<std::path::PathBuf> {
     Ok(crate::config::profile::profile_dir()?.join(KEY_FILE_NAME))
+}
+
+/// Path of the shared, machine-wide API key blob.
+pub fn global_key_file_path() -> Result<std::path::PathBuf> {
+    Ok(crate::config::profile::profile_dir()?.join(GLOBAL_KEY_FILE_NAME))
+}
+
+/// Loads the shared API key stored in the config directory, if any.
+pub fn load_global_key() -> Result<Option<String>> {
+    let path = global_key_file_path()?;
+    match fs::read_to_string(&path) {
+        Ok(blob) => decrypt_string(blob.trim()).map(Some),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(PackError::io(format!("read '{}'", path.display()), err)),
+    }
+}
+
+/// Stores the shared API key in the config directory, encrypted at rest.
+pub fn store_global_key(key: &str) -> Result<()> {
+    let blob = encrypt_string(key.trim())?;
+    let path = global_key_file_path()?;
+    atomic_write_secret(&path, blob.as_bytes())
+}
+
+/// Removes the shared API key from the config directory, if present.
+pub fn remove_global_key() -> Result<()> {
+    let path = global_key_file_path()?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(PackError::io(format!("remove '{}'", path.display()), err)),
+    }
 }
 
 /// Loads the per-user master key, creating a fresh random one on first use.
@@ -217,6 +254,64 @@ fn random_bytes(len: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Writes `contents` to `path` atomically (temp file + rename), private on
+/// Unix.
+fn atomic_write_secret(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        PackError::Config(format!(
+            "secret path '{}' has no parent directory",
+            path.display()
+        ))
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|err| PackError::io(format!("create '{}'", parent.display()), err))?;
+    let file_name = path.file_name().ok_or_else(|| {
+        PackError::Config(format!("secret path '{}' has no file name", path.display()))
+    })?;
+
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    let write_result = (|| -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&temporary)
+                .map_err(|err| PackError::io(format!("create '{}'", temporary.display()), err))?;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|err| PackError::io(format!("chmod '{}'", temporary.display()), err))?;
+            file.write_all(contents)
+                .map_err(|err| PackError::io(format!("write '{}'", temporary.display()), err))?;
+            file.sync_all()
+                .map_err(|err| PackError::io(format!("sync '{}'", temporary.display()), err))?;
+        }
+        #[cfg(not(unix))]
+        {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temporary)
+                .map_err(|err| PackError::io(format!("create '{}'", temporary.display()), err))?;
+            file.write_all(contents)
+                .map_err(|err| PackError::io(format!("write '{}'", temporary.display()), err))?;
+            file.sync_all()
+                .map_err(|err| PackError::io(format!("sync '{}'", temporary.display()), err))?;
+        }
+        fs::rename(&temporary, path)
+            .map_err(|err| PackError::io(format!("replace '{}'", path.display()), err))
+    })();
+    let _ = fs::remove_file(&temporary);
+    write_result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +376,28 @@ mod tests {
             matches!(err, PackError::Config(_)),
             "expected Config error, got {err:?}"
         );
+    }
+
+    #[test]
+    fn global_key_round_trips_and_removes() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("PACKCTL_HOME", dir.path().as_os_str());
+
+        assert_eq!(load_global_key().unwrap(), None);
+
+        store_global_key(" shared-key ").unwrap();
+        assert_eq!(load_global_key().unwrap().as_deref(), Some("shared-key"));
+
+        let blob = fs::read_to_string(global_key_file_path().unwrap()).unwrap();
+        assert!(!blob.contains("shared-key"), "must not be plaintext");
+        assert!(blob.starts_with(BLOB_PREFIX));
+
+        remove_global_key().unwrap();
+        assert_eq!(load_global_key().unwrap(), None);
+
+        // Removing again is a no-op.
+        remove_global_key().unwrap();
     }
 
     #[test]
