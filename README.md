@@ -2,7 +2,7 @@
 
 `packctl` is a Rust CLI for safely updating self-hosted Minecraft modpack servers. Upgrading a server pack (for example a CurseForge server pack) usually wipes your admin mods, custom config, and KubeJS changes. `packctl` treats a running server as three distinct layers — the upstream modpack, your local overlay, and persistent runtime data — and updates only what belongs to the modpack, so your customizations and world survive every upgrade.
 
-V1 targets CurseForge server packs on Linux, with two server controllers: CubeCoders AMP and a generic command-based controller.
+V1 targets CurseForge server packs (or local server-pack archives) on Linux, with two server controllers: CubeCoders AMP and a generic command-based controller.
 
 ## How it works
 
@@ -209,13 +209,52 @@ overrides the display name. A complete commented example lives at
 | --- | --- |
 | `name` | Optional display name; defaults to the file name. |
 | `[server] root` | The live server root directory. Relative paths resolve against the profile directory. |
-| `[pack] provider` | Pack provider. Only `"curseforge"` is supported in V1. |
-| `[pack] project_id` | The provider's project ID (a number). |
+| `[pack] provider` | Pack provider. `"curseforge"` or `"local"` in V1. |
+| `[pack] project_id` | The provider's project ID (a number). Required for CurseForge. |
 | `[pack] slug` | Optional human-friendly identifier. |
+| `[pack] archive` | Local server-pack archive: a zip file or a directory of zips. Required when `provider = "local"`. |
 | `[overlay] path` | Directory of the mirrored local overlay. Relative paths resolve against the profile directory. |
 | `[controller] type` | `"amp"` or `"command"`. |
 | `[controller] instance` | AMP instance name (required when `type = "amp"`). |
 | `[controller.command]` | Required when `type = "command"`: `status`, `stop`, and `start` argv arrays plus optional `timeout_ms`. |
+
+### Local archive provider
+
+`provider = "local"` follows a server pack you already have as a zip file,
+so updates need no CurseForge API key and no network access. Each archive is
+one version (named by its file stem); point `[pack] archive` at a single zip
+or at a directory of zips, in which case the most recently modified zip is
+"latest". Create the profile non-interactively with:
+
+```bash
+packctl create sb4 --provider local \
+  --archive /srv/packs/server-pack-1.19.1.zip \
+  --controller amp --instance Stoneblock401 --non-interactive
+```
+
+A local profile looks like:
+
+```toml
+name = "sb4"
+
+[server]
+root = "."
+
+[pack]
+provider = "local"
+archive = "/srv/packs"
+
+[overlay]
+path = "overlay"
+
+[controller]
+type = "amp"
+instance = "Stoneblock401"
+```
+
+`packctl versions`, `plan`, `update`, and `rollback` behave exactly as with a
+CurseForge pack; to update, drop a newer archive into the configured path
+(or edit `archive`) and run `packctl update`.
 
 ### Controllers
 
@@ -275,7 +314,7 @@ Everything else under the server root is treated as updater-managed content.
 | Command | Description |
 | --- | --- |
 | `packctl list` | List configured server profiles. |
-| `packctl create <server> [--source <url\|id\|slug>] [--apikey <key>] [--global] ...` | Interactively create a server profile. Defaults to a local `.packctl.toml` in the current directory; `--global` writes to the profile directory instead. `-n`/`--non-interactive` requires every value as a flag; `-f`/`--force` overwrites. |
+| `packctl create <server> [--source <url\|id\|slug>] [--provider <curseforge\|local>] [--archive <path>] [--apikey <key>] [--global] ...` | Interactively create a server profile. Defaults to a local `.packctl.toml` in the current directory; `--global` writes to the profile directory instead. `--provider local --archive <path>` follows a local server-pack zip (no API key needed). `-n`/`--non-interactive` requires every value as a flag; `-f`/`--force` overwrites. |
 | `packctl status <server>` | Show installed version, last update, managed-file count, snapshot count, and controller status. Local only, no network. |
 | `packctl apikey <server> [--set <key>] [--remove]` | Store, show, or remove the encrypted CurseForge API key. |
 | `packctl versions <server> [--json]` | List available upstream versions. `-j`/`--json` prints an array of `{id, name, released}`. |
