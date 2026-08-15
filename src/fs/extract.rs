@@ -246,6 +246,37 @@ mod tests {
     }
 
     #[test]
+    fn extract_server_pack_accepts_directory_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("dirs.zip");
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer
+                .add_directory("mods/", SimpleFileOptions::default())
+                .unwrap();
+            writer
+                .add_directory("config/", SimpleFileOptions::default())
+                .unwrap();
+            writer
+                .start_file("config/x.toml", SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"x").unwrap();
+            writer.finish().unwrap();
+        }
+
+        let dest = dir.path().join("server");
+        let files = extract_server_pack(&zip_path, &dest).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].rel_path, PathBuf::from("config/x.toml"));
+        assert_eq!(
+            std::fs::read_to_string(dest.join("config/x.toml")).unwrap(),
+            "x"
+        );
+    }
+
+    #[test]
     fn extract_server_pack_rejects_parent_traversal() {
         let dir = tempfile::tempdir().unwrap();
         let zip_path = dir.path().join("evil.zip");

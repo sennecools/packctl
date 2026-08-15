@@ -29,8 +29,9 @@ pub fn is_safe_relative(rel: &Path) -> bool {
 /// Normalizes a relative path and rejects unsafe forms.
 ///
 /// Backslashes are converted to forward slashes first. Absolute paths, `..`
-/// components, `.` components, empty components, and NUL bytes are rejected.
-/// Returns the cleaned relative path on success.
+/// components, `.` components, empty interior components, and NUL bytes are
+/// rejected. A single trailing separator (a directory entry such as `config/`)
+/// is allowed and stripped. Returns the cleaned relative path on success.
 pub fn normalize_relative(rel: &Path) -> Result<PathBuf> {
     if rel.is_absolute() {
         return Err(PackError::UnsafePath(rel.to_path_buf()));
@@ -40,7 +41,14 @@ pub fn normalize_relative(rel: &Path) -> Result<PathBuf> {
         return Err(PackError::UnsafePath(rel.to_path_buf()));
     }
     let normalized = as_str.replace('\\', "/");
-    for component in normalized.split('/') {
+    let trimmed = normalized.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(PackError::UnsafePathComponent {
+            path: rel.to_path_buf(),
+            component: String::new(),
+        });
+    }
+    for component in trimmed.split('/') {
         if matches!(component, "" | "." | "..") {
             return Err(PackError::UnsafePathComponent {
                 path: rel.to_path_buf(),
@@ -48,7 +56,7 @@ pub fn normalize_relative(rel: &Path) -> Result<PathBuf> {
             });
         }
     }
-    Ok(PathBuf::from(normalized))
+    Ok(PathBuf::from(trimmed))
 }
 
 /// Joins `rel` onto `root` after validating that `rel` is safe.
@@ -111,6 +119,18 @@ mod tests {
             normalize_relative(Path::new("a\\b\\c.jar")).unwrap(),
             PathBuf::from("a/b/c.jar")
         );
+        assert_eq!(
+            normalize_relative(Path::new("config/")).unwrap(),
+            PathBuf::from("config")
+        );
+        assert_eq!(
+            normalize_relative(Path::new("a/b/")).unwrap(),
+            PathBuf::from("a/b")
+        );
+        assert_eq!(
+            normalize_relative(Path::new("a\\b\\")).unwrap(),
+            PathBuf::from("a/b")
+        );
     }
 
     #[test]
@@ -119,7 +139,9 @@ mod tests {
         assert!(normalize_relative(Path::new("../x")).is_err());
         assert!(normalize_relative(Path::new("a/../b")).is_err());
         assert!(normalize_relative(Path::new("x/./y")).is_err());
+        assert!(normalize_relative(Path::new("a//b")).is_err());
         assert!(normalize_relative(Path::new("")).is_err());
+        assert!(normalize_relative(Path::new("/")).is_err());
         assert!(normalize_relative(Path::new("a\0b.jar")).is_err());
     }
 
