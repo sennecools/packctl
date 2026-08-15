@@ -120,11 +120,11 @@ control panel without extra virtual directories:
 
 ```text
 Server profile name [AllTheMods10]: atm10
+Server root [/amp/instances/AllTheMods10]:
+Overlay directory [/amp/instances/AllTheMods10/overlay]:
 CurseForge modpack URL or project ID: 925200
 CurseForge API key (optional, stored encrypted): <typed or empty>
 Found 'project 925200' (project 925200)? [Y/n] y
-Server root [/amp/instances/AllTheMods10]:
-Overlay directory [/amp/instances/AllTheMods10/overlay]:
 Server controller: amp
 AMP instance name [atm10]: ATM10
 
@@ -225,7 +225,7 @@ overrides the display name. A complete commented example lives at
 | `[pack] provider` | Pack provider. `"curseforge"` or `"local"` in V1. |
 | `[pack] project_id` | The provider's project ID (a number). Required for CurseForge. |
 | `[pack] slug` | Optional human-friendly identifier. |
-| `[pack] archive` | Local server-pack archive: a zip file or a directory of zips. Required when `provider = "local"`. |
+| `[pack] archive` | Optional. For `provider = "local"`: a zip file or a directory of zips. Defaults to `<server root>/packs` when omitted. |
 | `[overlay] path` | Directory of the mirrored local overlay. Relative paths resolve against the profile directory. |
 | `[controller] type` | `"amp"` or `"command"`. |
 | `[controller] instance` | AMP instance name (required when `type = "amp"`). |
@@ -233,17 +233,21 @@ overrides the display name. A complete commented example lives at
 
 ### Local archive provider
 
-`provider = "local"` follows a server pack you already have as a zip file,
-so updates need no CurseForge API key and no network access. Each archive is
-one version (named by its file stem); point `[pack] archive` at a single zip
-or at a directory of zips, in which case the most recently modified zip is
-"latest". Create the profile non-interactively with:
+`provider = "local"` follows a server pack you already have as a zip file, so
+updates need no CurseForge API key and no network access. Each archive is one
+version (named by its file stem). By default the pack is read from the `packs/`
+folder **inside the server root**: download the server-pack zip from the
+modpack author, drop it into `packs/`, and run `packctl update`. Create the
+profile non-interactively with:
 
 ```bash
 packctl create sb4 --provider local \
-  --archive /srv/packs/server-pack-1.19.1.zip \
   --controller amp --instance Stoneblock401 --non-interactive
 ```
+
+`create` makes the `packs/` drop folder automatically. To keep archives
+somewhere else instead, pass `--archive <path>` (a single zip or a directory
+of zips), in which case the most recently modified zip is "latest".
 
 A local profile looks like:
 
@@ -255,7 +259,6 @@ root = "."
 
 [pack]
 provider = "local"
-archive = "/srv/packs"
 
 [overlay]
 path = "overlay"
@@ -266,8 +269,9 @@ instance = "Stoneblock401"
 ```
 
 `packctl versions`, `plan`, `update`, and `rollback` behave exactly as with a
-CurseForge pack; to update, drop a newer archive into the configured path
-(or edit `archive`) and run `packctl update`.
+CurseForge pack. To update to a new version, drop a newer zip into `packs/`
+(or edit `archive` to point at another zip or folder) and run
+`packctl update` — the newest zip is treated as "latest".
 
 ### Controllers
 
@@ -327,7 +331,7 @@ Everything else under the server root is treated as updater-managed content.
 | Command | Description |
 | --- | --- |
 | `packctl list` | List configured server profiles. |
-| `packctl create <server> [--source <url\|id\|slug>] [--provider <curseforge\|local>] [--archive <path>] [--apikey <key>] [--global] ...` | Interactively create a server profile. Defaults to a local `.packctl.toml` in the current directory; `--global` writes to the profile directory instead. `--provider local --archive <path>` follows a local server-pack zip (no API key needed). `-n`/`--non-interactive` requires every value as a flag; `-f`/`--force` overwrites. |
+| `packctl create <server> [--source <url\|id\|slug>] [--provider <curseforge\|local>] [--archive <path>] [--apikey <key>] [--global] ...` | Interactively create a server profile. Defaults to a local `.packctl.toml` in the current directory; `--global` writes to the profile directory instead. `--provider local` follows a server-pack zip dropped into `<server root>/packs` (no API key needed); `--archive <path>` points elsewhere. `-n`/`--non-interactive` requires every value as a flag; `-f`/`--force` overwrites. |
 | `packctl status <server>` | Show installed version, last update, managed-file count, snapshot count, and controller status. Local only, no network. |
 | `packctl apikey <server> [--set <key>] [--remove] [--global]` | Store, show, or remove the encrypted CurseForge API key. `--global` stores one shared key used by every profile instead of a per-server key. |
 | `packctl versions <server> [--json]` | List available upstream versions. `-j`/`--json` prints an array of `{id, name, released}`. |

@@ -34,8 +34,13 @@ impl LocalArchiveProvider {
     /// most recently added archive is "latest") with file name as tiebreak.
     fn archive_paths(&self) -> Result<Vec<PathBuf>> {
         let metadata = fs::metadata(&self.archive).map_err(|err| {
+            let hint = if err.kind() == std::io::ErrorKind::NotFound {
+                "; create the folder and drop a server-pack zip into it"
+            } else {
+                ""
+            };
             PackError::Provider(format!(
-                "archive '{}' is not accessible: {err}",
+                "archive '{}' is not accessible: {err}{hint}",
                 self.archive.display()
             ))
         })?;

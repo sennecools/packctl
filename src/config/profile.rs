@@ -45,14 +45,18 @@ pub struct ServerSection {
     pub root: PathBuf,
 }
 
+/// Default subdirectory inside the server root where server-pack archives are
+/// dropped for `local` provider updates.
+pub const DEFAULT_DROP_DIR: &str = "packs";
+
 /// Which upstream pack the server follows.
 #[derive(Debug, Clone)]
 pub struct PackSection {
     pub provider: ProviderKind,
     pub project_id: u32,
     pub slug: Option<String>,
-    /// Local archive path (zip file or directory of zips) when the provider is
-    /// `local`.
+    /// Local archive path (zip file or directory of zips) for the `local`
+    /// provider. When omitted, `local` packs update from `<server root>/packs`.
     pub archive: Option<PathBuf>,
 }
 
@@ -318,12 +322,13 @@ impl RawProfile {
             provider: self.pack.provider,
             project_id: self.pack.project_id,
             slug: self.pack.slug,
-            archive: self
-                .pack
-                .archive
-                .as_ref()
-                .map(|path| resolve_against_config(config_dir, path))
-                .transpose()?,
+            archive: match &self.pack.archive {
+                Some(path) => Some(resolve_against_config(config_dir, path)?),
+                None if self.pack.provider == ProviderKind::Local => {
+                    Some(server.root.join(DEFAULT_DROP_DIR))
+                }
+                None => None,
+            },
         };
         let overlay = OverlaySection {
             path: resolve_against_config(config_dir, &self.overlay.path)?,
@@ -346,9 +351,6 @@ impl RawPack {
         match self.provider {
             ProviderKind::CurseForge if self.project_id == 0 => Err(PackError::Config(
                 "pack provider 'curseforge' requires a non-zero 'project_id'".to_string(),
-            )),
-            ProviderKind::Local if self.archive.as_deref().is_none() => Err(PackError::Config(
-                "pack provider 'local' requires an 'archive' path".to_string(),
             )),
             _ => Ok(()),
         }
@@ -788,7 +790,7 @@ instance = "x"
     }
 
     #[test]
-    fn local_profile_without_archive_errors() {
+    fn local_profile_without_archive_defaults_to_packs_drop_folder() {
         let _lock = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let _guard = EnvGuard::set("PACKCTL_HOME", dir.path().as_os_str());
@@ -796,12 +798,13 @@ instance = "x"
         let content = "[server]\nroot = \"/srv/mc\"\n\n[pack]\nprovider = \"local\"\n\n[overlay]\npath = \"overlay\"\n\n"
             .to_string()
             + AMP_CONTROLLER;
-        fs::write(dir.path().join("bad.toml"), content).unwrap();
+        fs::write(dir.path().join("drop.toml"), content).unwrap();
 
-        let err = load_profile("bad").unwrap_err();
-        assert!(
-            matches!(&err, PackError::Config(message) if message.contains("archive")),
-            "expected Config error, got {err:?}"
+        let profile = load_profile("drop").unwrap();
+        assert_eq!(profile.pack.provider, ProviderKind::Local);
+        assert_eq!(
+            profile.pack.archive.as_deref(),
+            Some(Path::new("/srv/mc/packs"))
         );
     }
 

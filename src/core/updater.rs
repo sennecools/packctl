@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 
-use crate::config::profile::{ProviderKind, ServerProfile};
+use crate::config::profile::{DEFAULT_DROP_DIR, ProviderKind, ServerProfile};
 use crate::controllers::ServerController;
 use crate::core::executor::UpdateExecutor;
 use crate::core::overlay::{OverlayEngine, OverlayFile};
@@ -77,18 +77,19 @@ impl Updater {
     /// Build an updater from a profile's configured provider and controller.
     ///
     /// CurseForge packs need an API key (from `$CF_API_KEY` or the profile);
-    /// local archives need no credentials.
+    /// local archives need no credentials. A local pack without an `archive`
+    /// reads zips dropped into `<server root>/packs`.
     pub fn from_profile(profile: &ServerProfile) -> Result<Self> {
         let provider: Box<dyn PackProvider> = match profile.pack.provider {
             ProviderKind::CurseForge => Box::new(CurseForgeProvider::new(CfClient::with_api_key(
                 profile.curseforge_api_key()?,
             ))),
             ProviderKind::Local => {
-                let archive = profile.pack.archive.clone().ok_or_else(|| {
-                    PackError::Config(
-                        "pack provider 'local' requires an 'archive' path".to_string(),
-                    )
-                })?;
+                let archive = profile
+                    .pack
+                    .archive
+                    .clone()
+                    .unwrap_or_else(|| profile.server.root.join(DEFAULT_DROP_DIR));
                 Box::new(LocalArchiveProvider::new(archive))
             }
         };
@@ -823,10 +824,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn from_profile_local_without_archive_errors() {
+    #[tokio::test]
+    async fn from_profile_local_without_archive_defaults_to_packs_drop_folder() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut profile = profile(&tmp.path().join("server"), &tmp.path().join("overlay"));
+        let server_root = tmp.path().join("server");
+        let mut profile = profile(&server_root, &tmp.path().join("overlay"));
         profile.pack = PackSection {
             provider: ProviderKind::Local,
             project_id: 0,
@@ -834,7 +836,18 @@ mod tests {
             archive: None,
         };
 
-        let err = Updater::from_profile(&profile).err().unwrap();
-        assert!(matches!(err, PackError::Config(_)));
+        let updater = Updater::from_profile(&profile).unwrap();
+
+        // The drop folder does not exist yet, so listing versions points the
+        // error at the default <server root>/packs path.
+        let err = updater
+            .provider
+            .list_versions(&updater.pack_ref())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("packs"),
+            "expected the local provider to default to the packs drop folder, got: {err}"
+        );
     }
 }

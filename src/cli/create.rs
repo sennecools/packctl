@@ -9,8 +9,8 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::config::profile::{
-    CommandConfig, ControllerKind, ProfileDraft, ProviderKind, SecretsSection, write_local_profile,
-    write_profile,
+    CommandConfig, ControllerKind, DEFAULT_DROP_DIR, ProfileDraft, ProviderKind, SecretsSection,
+    write_local_profile, write_profile,
 };
 use crate::error::{PackError, Result};
 use crate::providers::curseforge::client::CfClient;
@@ -30,6 +30,7 @@ pub struct CreateArgs {
     /// Pack provider kind: "curseforge" (default) or "local".
     pub provider: Option<String>,
     /// Local archive path (zip file or directory of zips) for `--provider local`.
+    /// Defaults to `<server root>/packs`, where zips are dropped for updates.
     pub archive: Option<PathBuf>,
     /// CurseForge API key to store (encrypted) with the new profile.
     pub apikey: Option<String>,
@@ -82,6 +83,11 @@ pub async fn run(args: CreateArgs) -> Result<()> {
     let provider = resolve_provider_kind(args.provider.as_deref())?;
     let name = resolve_name(args.name.as_deref(), interactive)?;
 
+    let cwd =
+        env::current_dir().map_err(|err| PackError::io("determine current directory", err))?;
+    let root = resolve_root(args.root.clone(), &cwd, interactive)?;
+    let overlay = resolve_overlay(args.overlay.clone(), &root, interactive)?;
+
     let (pack, archive, api_key) = match provider {
         ProviderKind::CurseForge => {
             let api_key = resolve_api_key(args.apikey.clone(), interactive)?;
@@ -108,9 +114,14 @@ pub async fn run(args: CreateArgs) -> Result<()> {
             (pack, None, api_key)
         }
         ProviderKind::Local => {
-            let archive = resolve_archive(args.archive.clone(), interactive)?;
+            let archive = resolve_archive(args.archive.clone(), &root, interactive)?;
+            ensure_archive_ready(&archive)?;
             let pack = ResolvedPack {
-                name: archive_display_name(&archive),
+                name: if args.archive.is_some() {
+                    archive_display_name(&archive)
+                } else {
+                    name.clone()
+                },
                 slug: String::new(),
                 project_id: 0,
             };
@@ -118,10 +129,6 @@ pub async fn run(args: CreateArgs) -> Result<()> {
         }
     };
 
-    let cwd =
-        env::current_dir().map_err(|err| PackError::io("determine current directory", err))?;
-    let root = resolve_root(args.root.clone(), &cwd, interactive)?;
-    let overlay = resolve_overlay(args.overlay.clone(), &root, interactive)?;
     let controller = select_controller(&args, &name, interactive).await?;
 
     let secrets = match &api_key {
@@ -141,7 +148,11 @@ pub async fn run(args: CreateArgs) -> Result<()> {
         provider,
         project_id: pack.project_id,
         slug: (!pack.slug.is_empty()).then(|| pack.slug.clone()),
-        archive,
+        archive: match &archive {
+            Some(path) if !args.global => Some(relativize(&cwd, path)),
+            Some(path) => Some(path.clone()),
+            None => None,
+        },
         overlay_path: if args.global {
             overlay.clone()
         } else {
@@ -170,6 +181,9 @@ pub async fn run(args: CreateArgs) -> Result<()> {
     }
     println!("  server:     {}", root.display());
     println!("  overlay:    {}", overlay.display());
+    if let Some(archive) = &archive {
+        println!("  archive:    {}", archive.display());
+    }
     println!("  controller: {}", controller_description(&draft));
     if api_key.is_some() {
         println!("  api key:    stored (encrypted)");
@@ -181,6 +195,14 @@ pub async fn run(args: CreateArgs) -> Result<()> {
         println!("Next: packctl status {}", draft.name);
     } else {
         println!("Next: packctl status");
+    }
+    if provider == ProviderKind::Local
+        && let Some(archive) = &archive
+    {
+        println!(
+            "Drop a server-pack zip into '{}', then run 'packctl update'.",
+            archive.display()
+        );
     }
     Ok(())
 }
@@ -197,40 +219,65 @@ fn resolve_provider_kind(value: Option<&str>) -> Result<ProviderKind> {
 }
 
 /// Resolves the local archive path, prompting when interactive and omitted.
-fn resolve_archive(flag: Option<PathBuf>, interactive: bool) -> Result<PathBuf> {
-    let resolved = match flag {
+///
+/// With no `--archive`, a local profile reads server-pack zips dropped into
+/// `<server root>/packs`; an explicitly supplied path must already exist as a
+/// zip file or a directory (so a typo is caught during setup).
+fn resolve_archive(flag: Option<PathBuf>, root: &Path, interactive: bool) -> Result<PathBuf> {
+    let default = root.join(DEFAULT_DROP_DIR);
+    match flag {
         Some(path) => {
             let cwd = env::current_dir()
                 .map_err(|err| PackError::io("determine current directory", err))?;
-            absolute_path(&path, &cwd)
+            let resolved = absolute_path(&path, &cwd);
+            require_archive_path(&resolved)?;
+            Ok(resolved)
         }
         None if interactive => {
             let input: String = dialoguer::Input::new()
                 .with_prompt("Server pack archive (zip file or directory of zips)")
+                .default(default.display().to_string())
                 .interact_text()
                 .map_err(|err| dialoguer_error("read archive path", err))?;
-            absolute_path(Path::new(&input.trim()), &cwd_env()?)
+            Ok(absolute_path(Path::new(&input.trim()), &cwd_env()?))
         }
-        None => {
-            return Err(PackError::Config(
-                "--provider local requires --archive <path> in non-interactive mode".to_string(),
-            ));
-        }
-    };
+        None => Ok(default),
+    }
+}
 
-    let metadata = std::fs::metadata(&resolved).map_err(|err| {
+/// Makes sure the resolved archive path is usable as the drop location.
+///
+/// An existing zip file or directory is left untouched; a missing path becomes
+/// an empty directory so server-pack zips can be dropped into it.
+fn ensure_archive_ready(archive: &Path) -> Result<()> {
+    match std::fs::metadata(archive) {
+        Ok(meta) if meta.is_file() || meta.is_dir() => Ok(()),
+        Ok(_) => Err(PackError::Config(format!(
+            "archive '{}' is neither a file nor a directory",
+            archive.display()
+        ))),
+        Err(_) => std::fs::create_dir_all(archive).map_err(|err| {
+            PackError::io(format!("create drop folder '{}'", archive.display()), err)
+        }),
+    }
+}
+
+/// Validates that an explicitly supplied archive path exists as a file or a
+/// directory.
+fn require_archive_path(path: &Path) -> Result<()> {
+    let metadata = std::fs::metadata(path).map_err(|err| {
         PackError::Config(format!(
             "archive '{}' is not accessible: {err}",
-            resolved.display()
+            path.display()
         ))
     })?;
     if !metadata.is_file() && !metadata.is_dir() {
         return Err(PackError::Config(format!(
             "archive '{}' is neither a file nor a directory",
-            resolved.display()
+            path.display()
         )));
     }
-    Ok(resolved)
+    Ok(())
 }
 
 fn cwd_env() -> Result<PathBuf> {
@@ -690,20 +737,37 @@ mod tests {
         let existing = dir.path().join("pack.zip");
         std::fs::write(&existing, b"zip").unwrap();
 
-        let resolved = resolve_archive(Some(existing.clone()), false).unwrap();
+        let root = dir.path().to_path_buf();
+        let resolved = resolve_archive(Some(existing.clone()), &root, false).unwrap();
         assert_eq!(resolved, existing);
 
-        let missing = resolve_archive(Some(dir.path().join("nope.zip")), false);
+        let missing = resolve_archive(Some(dir.path().join("nope.zip")), &root, false);
         assert!(matches!(missing, Err(PackError::Config(_))));
     }
 
     #[test]
-    fn resolve_archive_non_interactive_without_flag_errors() {
-        let err = resolve_archive(None, false).unwrap_err();
-        assert!(
-            matches!(&err, PackError::Config(message) if message.contains("--archive")),
-            "error: {err:?}"
-        );
+    fn resolve_archive_without_flag_defaults_to_packs_drop_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("server");
+
+        let resolved = resolve_archive(None, &root, false).unwrap();
+        assert_eq!(resolved, root.join(DEFAULT_DROP_DIR));
+    }
+
+    #[test]
+    fn ensure_archive_ready_creates_missing_drop_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let drop = dir.path().join("server").join("packs");
+        assert!(!drop.exists());
+
+        ensure_archive_ready(&drop).unwrap();
+        assert!(drop.is_dir());
+
+        // Already existing paths (file or directory) are left untouched.
+        let file = dir.path().join("pack.zip");
+        std::fs::write(&file, b"zip").unwrap();
+        ensure_archive_ready(&file).unwrap();
+        assert!(file.is_file());
     }
 
     #[test]

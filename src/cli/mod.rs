@@ -60,7 +60,8 @@ pub enum Command {
         /// Pack provider kind: "curseforge" (default) or "local"
         #[arg(long)]
         provider: Option<String>,
-        /// Local archive path (zip file or directory of zips) for --provider local
+        /// Local archive path (zip file or directory of zips) for --provider local;
+        /// defaults to <server root>/packs
         #[arg(long)]
         archive: Option<PathBuf>,
         /// CurseForge API key to store (encrypted) with the new profile
