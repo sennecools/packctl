@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::core::overlay::{OverlayEngine, OverlayFile};
-use crate::core::planner::{FileChange, UpdatePlan};
+use crate::core::planner::{ChangeKind, FileChange, UpdatePlan};
 use crate::error::{PackError, Result};
 use crate::fs::copy::{copy_if_changed, remove_file};
 use crate::fs::paths::{is_within, safe_join};
@@ -41,6 +41,7 @@ impl UpdateExecutor {
     /// `staged_root`; both are enforced with contextual errors. Returns how
     /// many files were actually written.
     pub fn apply_plan(&self, plan: &UpdatePlan, staged_root: &Path) -> Result<usize> {
+        validate_plan_paths(plan, &self.server_root, staged_root)?;
         let mut writes = 0;
 
         for change in &plan.removals {
@@ -88,7 +89,53 @@ fn staged_source<'a>(change: &'a FileChange, staged_root: &Path) -> Result<&'a P
             path: change.rel_path.clone(),
         });
     }
+    reject_symlink_components(staged_root, source)?;
     Ok(source)
+}
+
+/// Rejects a path that would traverse a symlink before a live-server mutation.
+fn reject_symlink_components(root: &Path, path: &Path) -> Result<()> {
+    let rel = path
+        .strip_prefix(root)
+        .map_err(|_| PackError::UnsafePath(path.to_path_buf()))?;
+    let mut current = root.to_path_buf();
+    for component in rel.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(PackError::UnsafePathComponent {
+                    path: path.to_path_buf(),
+                    component: current.display().to_string(),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(PackError::io(
+                    format!("stat '{}'", current.display()),
+                    error,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates every source and destination before making the first mutation.
+fn validate_plan_paths(plan: &UpdatePlan, server_root: &Path, staged_root: &Path) -> Result<()> {
+    for change in plan
+        .removals
+        .iter()
+        .chain(plan.additions.iter())
+        .chain(plan.modifications.iter())
+    {
+        let dest = safe_join(server_root, &change.rel_path)?;
+        reject_symlink_components(server_root, &dest)?;
+        if change.kind != ChangeKind::Remove {
+            staged_source(change, staged_root)?;
+        }
+    }
+    Ok(())
 }
 
 /// Builds the contextual error for a change that has no recorded source file.
@@ -151,6 +198,7 @@ fn overlay_failed_rel(error: &PackError, server_root: &Path) -> Option<PathBuf> 
                     .to_path_buf(),
             )
         }
+        PackError::Path { path, .. } if path.is_relative() => Some(path.clone()),
         PackError::Path { path, .. } => path.strip_prefix(server_root).ok().map(Path::to_path_buf),
         _ => None,
     }
@@ -367,6 +415,35 @@ mod tests {
                 .apply_plan(&p, &staging)
                 .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_plan_rejects_symlink_destination_before_mutating() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let server = tmp.path().join("server");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&server).unwrap();
+        symlink(&outside, server.join("mods")).unwrap();
+        let staging = tmp.path().join("staging");
+        write(&staging.join("mods/a.jar"), b"a");
+        let p = plan(
+            vec![change(
+                "mods/a.jar",
+                ChangeKind::Add,
+                Some(staging.join("mods/a.jar")),
+            )],
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(
+            UpdateExecutor::new(server)
+                .apply_plan(&p, &staging)
+                .is_err()
+        );
+        assert!(!outside.join("a.jar").exists());
     }
 
     #[test]

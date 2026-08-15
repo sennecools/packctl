@@ -99,6 +99,30 @@ impl OverlayEngine {
     /// unsafe relative paths are rejected with an error naming the
     /// destination. Parent directories are created as needed.
     pub fn apply(&self, files: &[OverlayFile], server_root: &Path) -> Result<usize> {
+        for file in files {
+            let dest = safe_join(server_root, &file.rel_path)?;
+            reject_symlink_components(&self.root, &file.source)?;
+            reject_symlink_components(server_root, &dest)?;
+            let metadata = std::fs::metadata(&file.source).map_err(|error| PackError::Path {
+                message: format!(
+                    "overlay source '{}' is unavailable: {error}",
+                    file.source.display()
+                ),
+                path: file.rel_path.clone(),
+            })?;
+            if !metadata.is_file()
+                || metadata.len() != file.size
+                || sha256_file(&file.source)? != file.sha256
+            {
+                return Err(PackError::Path {
+                    message: format!(
+                        "overlay file '{}' changed after the update plan was prepared; run packctl plan again",
+                        file.rel_path.display()
+                    ),
+                    path: file.rel_path.clone(),
+                });
+            }
+        }
         let mut copied = 0;
         for file in files {
             let dest = safe_join(server_root, &file.rel_path)?;
@@ -108,6 +132,41 @@ impl OverlayEngine {
         }
         Ok(copied)
     }
+}
+
+fn reject_symlink_components(root: &Path, path: &Path) -> Result<()> {
+    let Ok(rel) = path.strip_prefix(root) else {
+        // `OverlayFile` remains public and callers may construct one directly.
+        // Scan-produced files are root-relative; for external sources still
+        // reject a symlink target without changing that interface contract.
+        return match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Err(PackError::UnsafePath(path.to_path_buf()))
+            }
+            Ok(_) | Err(_) => Ok(()),
+        };
+    };
+    let mut current = root.to_path_buf();
+    for component in rel.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(PackError::UnsafePathComponent {
+                    path: path.to_path_buf(),
+                    component: current.display().to_string(),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(PackError::io(
+                    format!("stat '{}'", current.display()),
+                    error,
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Validates a relative overlay path and returns its normalized form.
