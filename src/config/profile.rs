@@ -703,6 +703,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     #[test]
     fn full_profile_parses() {
         let _lock = env_lock();
@@ -789,6 +790,7 @@ instance = "x"
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_profile_without_archive_defaults_to_packs_drop_folder() {
         let _lock = env_lock();
@@ -1035,6 +1037,7 @@ timeout_ms = 30000
         assert_eq!(command.timeout_ms, Some(30000));
     }
 
+    #[cfg(unix)]
     #[test]
     fn write_profile_round_trips_amp() {
         let _lock = env_lock();
@@ -1151,6 +1154,7 @@ timeout_ms = 30000
         write_profile(&draft, true).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn write_profile_round_trips_local() {
         let _lock = env_lock();
@@ -1250,6 +1254,7 @@ timeout_ms = 30000
         assert_eq!(profile.controller.instance.as_deref(), Some("my-server"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_profile_uses_local_file_without_server_name() {
         let _lock = env_lock();
@@ -1322,6 +1327,7 @@ timeout_ms = 30000
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn curseforge_api_key_prefers_env_over_stored() {
         let _lock = env_lock();
@@ -1358,6 +1364,7 @@ timeout_ms = 30000
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn curseforge_api_key_falls_back_to_shared_global_key() {
         let _lock = env_lock();

@@ -289,6 +289,7 @@ mod tests {
         assert!(!dest.join("evil").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn extract_server_pack_rejects_absolute_path() {
         let dir = tempfile::tempdir().unwrap();

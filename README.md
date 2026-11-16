@@ -392,3 +392,5 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
+
+The full suite runs on Linux, which is what CI uses. Some tests are Unix-only and are compiled out elsewhere (`#[cfg(unix)]`): the controller tests (they run `#!/bin/sh` scripts), the API key encryption tests (the master key is read from `/dev/urandom`), the symlink tests, and tests that assert POSIX absolute paths such as `/srv/mc`. The remaining tests also build and run on Windows.

@@ -180,6 +180,7 @@ mod tests {
         assert!(!is_jar_path(Path::new("mods/foo.jar.bak")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn is_safe_relative_checks() {
         assert!(is_safe_relative(Path::new("mods/foo.jar")));

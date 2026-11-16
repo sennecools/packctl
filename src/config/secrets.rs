@@ -317,6 +317,7 @@ mod tests {
     use super::*;
     use crate::testutil::{EnvGuard, env_lock};
 
+    #[cfg(unix)]
     #[test]
     fn encrypt_then_decrypt_round_trips() {
         let _lock = env_lock();
@@ -331,6 +332,7 @@ mod tests {
         assert_eq!(decrypt_string(&blob).unwrap(), "my-secret-key");
     }
 
+    #[cfg(unix)]
     #[test]
     fn master_key_is_created_once_and_private() {
         let _lock = env_lock();
@@ -378,6 +380,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn global_key_round_trips_and_removes() {
         let _lock = env_lock();
@@ -413,6 +416,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn decrypt_fails_with_wrong_key() {
         let _lock = env_lock();
