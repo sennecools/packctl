@@ -75,7 +75,9 @@ fn print_issues(issues: &[ValidationIssue]) {
 }
 
 /// Builds the `N warning(s), M error(s)` summary line.
-fn issue_summary(issues: &[ValidationIssue]) -> String {
+///
+/// Shared with the doctor command so both report findings the same way.
+pub(super) fn issue_summary(issues: &[ValidationIssue]) -> String {
     let warnings = issues
         .iter()
         .filter(|issue| issue.severity == Severity::Warning)
@@ -210,5 +212,37 @@ mod tests {
         let loaded = store.load().unwrap();
         let issues = check_managed_files(&root, PROFILE, &loaded).unwrap();
         assert!(issues.is_empty(), "issues: {issues:?}");
+    }
+
+    fn issue(severity: Severity) -> ValidationIssue {
+        ValidationIssue {
+            severity,
+            message: "finding".to_string(),
+        }
+    }
+
+    #[test]
+    fn issue_summary_counts_each_severity_separately() {
+        assert_eq!(issue_summary(&[]), "0 warning(s), 0 error(s)");
+        assert_eq!(
+            issue_summary(&[issue(Severity::Warning), issue(Severity::Warning)]),
+            "2 warning(s), 0 error(s)"
+        );
+        assert_eq!(
+            issue_summary(&[issue(Severity::Error)]),
+            "0 warning(s), 1 error(s)"
+        );
+        // Order must not matter: errors between warnings are still counted
+        // as errors.
+        assert_eq!(
+            issue_summary(&[
+                issue(Severity::Warning),
+                issue(Severity::Error),
+                issue(Severity::Warning),
+                issue(Severity::Error),
+                issue(Severity::Error),
+            ]),
+            "2 warning(s), 3 error(s)"
+        );
     }
 }

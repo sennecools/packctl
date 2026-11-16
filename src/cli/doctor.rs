@@ -4,6 +4,7 @@
 //! findings. The command exits non-zero when any check fails so scripts and
 //! remote invocations can react to the result (see design notes "Validation").
 
+use super::validate::issue_summary;
 use crate::core::overlay::OverlayEngine;
 use crate::core::updater::Updater;
 use crate::core::validation::{Severity, ValidationIssue, has_errors, validate};
@@ -36,17 +37,4 @@ fn print_issues(issues: &[ValidationIssue]) {
             Severity::Error => println!("[error] {}", issue.message),
         }
     }
-}
-
-/// Builds the `N warning(s), M error(s)` summary line.
-fn issue_summary(issues: &[ValidationIssue]) -> String {
-    let warnings = issues
-        .iter()
-        .filter(|issue| issue.severity == Severity::Warning)
-        .count();
-    let errors = issues
-        .iter()
-        .filter(|issue| issue.severity == Severity::Error)
-        .count();
-    format!("{warnings} warning(s), {errors} error(s)")
 }
