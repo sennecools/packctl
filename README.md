@@ -1,8 +1,28 @@
 # packctl
 
+[![ci](https://github.com/sennecools/packctl/actions/workflows/ci.yml/badge.svg)](https://github.com/sennecools/packctl/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/sennecools/packctl)](https://github.com/sennecools/packctl/releases)
+
 `packctl` is a Rust CLI for safely updating self-hosted Minecraft modpack servers. Upgrading a server pack (for example a CurseForge server pack) usually wipes your admin mods, custom config, and KubeJS changes. `packctl` treats a running server as three distinct layers — the upstream modpack, your local overlay, and persistent runtime data — and updates only what belongs to the modpack, so your customizations and world survive every upgrade.
 
 V1 targets CurseForge server packs (or local server-pack archives) on Linux, with two server controllers: CubeCoders AMP and a generic command-based controller.
+
+## Quick start
+
+On the Linux machine that hosts the server:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sennecools/packctl/main/install.sh | sh
+cd /path/to/server       # the server root
+packctl create atm10     # interactive wizard, writes .packctl.toml here
+packctl plan             # preview the update; changes nothing
+packctl update           # stop, snapshot, apply, validate, start
+packctl rollback         # restore the snapshot if the update went wrong
+```
+
+`create` asks for the modpack, how the server is controlled, and (for CurseForge) an optional API key. Each step is described in detail below: [Installation](#installation), [Configuration](#configuration), [Commands](#commands), and [Recovering from a failed update](#recovering-from-a-failed-update).
+
+The installer defaults to the latest tagged release, `v0.1.0`. Pack-owned folder sync, `.packctlignore`, and the default `packs/` drop folder for the local provider were added after that tag and are currently only in the `rolling` build (see [Installation](#installation)).
 
 ## How it works
 
