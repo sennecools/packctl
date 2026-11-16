@@ -306,4 +306,40 @@ mod tests {
         let err = provider.list_versions(&pack_ref()).await.unwrap_err();
         assert!(matches!(err, PackError::Provider(_)));
     }
+
+    #[tokio::test]
+    async fn directory_ignores_everything_that_is_not_a_zip_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_zip(&dir.path().join("a.zip"), &[("mods/a.jar", b"a")]);
+        std::fs::write(dir.path().join("notes.txt"), b"not a pack").unwrap();
+        // Looks like an archive by name only: no .zip extension.
+        std::fs::write(dir.path().join("zip"), b"not a pack").unwrap();
+        std::fs::write(dir.path().join("b.zip.part"), b"partial download").unwrap();
+
+        let provider = LocalArchiveProvider::new(dir.path().to_path_buf());
+        let versions = provider.list_versions(&pack_ref()).await.unwrap();
+
+        assert_eq!(versions.len(), 1, "versions: {versions:?}");
+        assert_eq!(versions[0].id, "a.zip");
+        assert_eq!(versions[0].name, "a");
+    }
+
+    #[tokio::test]
+    async fn directory_without_archives_lists_nothing_and_cannot_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"not a pack").unwrap();
+
+        let provider = LocalArchiveProvider::new(dir.path().to_path_buf());
+        let pack = pack_ref();
+
+        // An empty drop folder is a valid state, not a broken profile.
+        assert!(provider.list_versions(&pack).await.unwrap().is_empty());
+
+        // But there is nothing to update to, so resolving must fail rather
+        // than pick the non-archive file.
+        let latest = provider
+            .resolve_version(&pack, &VersionSelector::Latest)
+            .await;
+        assert!(matches!(latest, Err(PackError::Provider(_))));
+    }
 }
