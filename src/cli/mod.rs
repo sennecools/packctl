@@ -234,3 +234,263 @@ pub async fn run() -> Result<()> {
         Command::Validate { server } => validate::run(server.as_deref()).await,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+    use clap::error::ErrorKind;
+
+    use super::*;
+
+    fn parse(args: &[&str]) -> Command {
+        match Cli::try_parse_from(args) {
+            Ok(cli) => cli.command,
+            Err(err) => panic!("{args:?} should parse: {err}"),
+        }
+    }
+
+    fn parse_error(args: &[&str]) -> ErrorKind {
+        match Cli::try_parse_from(args) {
+            Ok(_) => panic!("{args:?} should be rejected"),
+            Err(err) => err.kind(),
+        }
+    }
+
+    #[test]
+    fn command_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn list_takes_no_arguments() {
+        assert!(matches!(parse(&["packctl", "list"]), Command::List));
+        assert_eq!(
+            parse_error(&["packctl", "list", "atm10"]),
+            ErrorKind::UnknownArgument
+        );
+    }
+
+    #[test]
+    fn update_parses_server_version_and_short_flags() {
+        let Command::Update {
+            server,
+            version,
+            non_interactive,
+            verbose,
+        } = parse(&["packctl", "update", "atm10", "1.2.3", "-n", "-v"])
+        else {
+            panic!("expected the update command");
+        };
+        assert_eq!(server.as_deref(), Some("atm10"));
+        assert_eq!(version.as_deref(), Some("1.2.3"));
+        assert!(non_interactive);
+        assert!(verbose);
+    }
+
+    #[test]
+    fn update_defaults_to_interactive_and_no_explicit_target() {
+        let Command::Update {
+            server,
+            version,
+            non_interactive,
+            verbose,
+        } = parse(&["packctl", "update"])
+        else {
+            panic!("expected the update command");
+        };
+        assert_eq!(server, None);
+        assert_eq!(version, None);
+        assert!(!non_interactive);
+        assert!(!verbose);
+    }
+
+    #[test]
+    fn plan_parses_long_verbose_and_leaves_version_unset() {
+        let Command::Plan {
+            server,
+            version,
+            verbose,
+        } = parse(&["packctl", "plan", "atm10", "--verbose"])
+        else {
+            panic!("expected the plan command");
+        };
+        assert_eq!(server.as_deref(), Some("atm10"));
+        assert_eq!(version, None);
+        assert!(verbose);
+    }
+
+    #[test]
+    fn plan_has_no_non_interactive_flag() {
+        // `plan` never mutates, so the confirmation flag belongs to `update`
+        // only.
+        assert_eq!(
+            parse_error(&["packctl", "plan", "atm10", "-n"]),
+            ErrorKind::UnknownArgument
+        );
+    }
+
+    #[test]
+    fn create_parses_local_provider_with_command_controller() {
+        let Command::Create {
+            name,
+            non_interactive,
+            force,
+            global,
+            source,
+            provider,
+            archive,
+            apikey,
+            root,
+            overlay,
+            controller,
+            instance,
+            status,
+            stop,
+            start,
+            timeout_ms,
+        } = parse(&[
+            "packctl",
+            "create",
+            "x",
+            "-n",
+            "--provider",
+            "local",
+            "--archive",
+            "p.zip",
+            "--controller",
+            "command",
+            "--status",
+            "systemctl is-active mc",
+            "--timeout-ms",
+            "500",
+        ])
+        else {
+            panic!("expected the create command");
+        };
+        assert_eq!(name.as_deref(), Some("x"));
+        assert!(non_interactive);
+        assert_eq!(provider.as_deref(), Some("local"));
+        assert_eq!(archive, Some(PathBuf::from("p.zip")));
+        assert_eq!(controller.as_deref(), Some("command"));
+        // The command line is kept as one string; splitting it into argv is
+        // the create command's job.
+        assert_eq!(status.as_deref(), Some("systemctl is-active mc"));
+        assert_eq!(timeout_ms, Some(500));
+
+        // Everything that was not passed stays unset so the wizard can tell
+        // "not given" apart from a value.
+        assert!(!force);
+        assert!(!global);
+        assert_eq!(source, None);
+        assert_eq!(apikey, None);
+        assert_eq!(root, None);
+        assert_eq!(overlay, None);
+        assert_eq!(instance, None);
+        assert_eq!(stop, None);
+        assert_eq!(start, None);
+    }
+
+    #[test]
+    fn create_rejects_a_non_numeric_or_negative_timeout() {
+        assert_eq!(
+            parse_error(&["packctl", "create", "x", "--timeout-ms", "abc"]),
+            ErrorKind::ValueValidation
+        );
+        assert_eq!(
+            parse_error(&["packctl", "create", "x", "--timeout-ms=-1"]),
+            ErrorKind::ValueValidation
+        );
+    }
+
+    #[test]
+    fn apikey_parses_set_and_global() {
+        let Command::Apikey {
+            server,
+            set,
+            remove,
+            global,
+        } = parse(&["packctl", "apikey", "x", "--set", "k", "--global"])
+        else {
+            panic!("expected the apikey command");
+        };
+        assert_eq!(server.as_deref(), Some("x"));
+        assert_eq!(set.as_deref(), Some("k"));
+        assert!(!remove);
+        assert!(global);
+    }
+
+    #[test]
+    fn apikey_set_requires_a_value() {
+        assert_eq!(
+            parse_error(&["packctl", "apikey", "x", "--set"]),
+            ErrorKind::InvalidValue
+        );
+    }
+
+    #[test]
+    fn versions_parses_short_json_flag() {
+        let Command::Versions { server, json } = parse(&["packctl", "versions", "x", "-j"]) else {
+            panic!("expected the versions command");
+        };
+        assert_eq!(server.as_deref(), Some("x"));
+        assert!(json);
+
+        let Command::Versions { json, .. } = parse(&["packctl", "versions", "x"]) else {
+            panic!("expected the versions command");
+        };
+        assert!(!json);
+    }
+
+    #[test]
+    fn server_argument_is_optional_for_single_server_commands() {
+        // These fall back to .packctl.toml in the current directory.
+        assert!(matches!(
+            parse(&["packctl", "rollback"]),
+            Command::Rollback { server: None }
+        ));
+        assert!(matches!(
+            parse(&["packctl", "status"]),
+            Command::Status { server: None }
+        ));
+        assert!(matches!(
+            parse(&["packctl", "doctor"]),
+            Command::Doctor { server: None }
+        ));
+        assert!(matches!(
+            parse(&["packctl", "validate"]),
+            Command::Validate { server: None }
+        ));
+
+        let Command::Rollback { server } = parse(&["packctl", "rollback", "atm10"]) else {
+            panic!("expected the rollback command");
+        };
+        assert_eq!(server.as_deref(), Some("atm10"));
+    }
+
+    #[test]
+    fn rollback_does_not_accept_a_version() {
+        // Rollback always restores the latest snapshot; a second positional
+        // must not be silently ignored.
+        assert_eq!(
+            parse_error(&["packctl", "rollback", "atm10", "1.2.3"]),
+            ErrorKind::UnknownArgument
+        );
+    }
+
+    #[test]
+    fn a_subcommand_is_required() {
+        // `arg_required_else_help` prints help instead of running anything.
+        assert_eq!(
+            parse_error(&["packctl"]),
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+    }
+
+    #[test]
+    fn unknown_subcommand_is_rejected() {
+        assert_eq!(
+            parse_error(&["packctl", "bogus"]),
+            ErrorKind::InvalidSubcommand
+        );
+    }
+}
