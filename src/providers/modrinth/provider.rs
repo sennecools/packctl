@@ -300,17 +300,14 @@ async fn reuse_live_file(live: &Path, dest: &Path, planned: &PlannedDownload) ->
             .flush()
             .await
             .map_err(|e| PackError::io(format!("flush '{}'", partial.display()), e))?;
-        if check_hashes(
+        let verified = check_hashes(
             &live.display().to_string(),
             &expected,
             size,
             &hashers.finish(),
         )
-        .is_err()
-        {
-            return Ok(false);
-        }
-        Ok::<bool, PackError>(true)
+        .is_ok();
+        Ok::<bool, PackError>(verified)
     }
     .await;
     drop(output);

@@ -6,7 +6,6 @@ rust-version = "1.88"
 description = "Safely update self-hosted Minecraft modpack servers: upstream pack + local overlay + persistent data"
 license = "MIT"
 repository = "https://github.com/sennecools/packctl"
-homepage = "https://github.com/sennecools/packctl"
 readme = "README.md"
 keywords = ["minecraft", "modpack", "curseforge", "modrinth", "server"]
 categories = ["command-line-utilities", "games"]

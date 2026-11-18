@@ -198,8 +198,10 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
+    /// A no-op command resolved through `PATH`: `true` lives in `/bin` on
+    /// Linux but only in `/usr/bin` on macOS.
     fn true_command() -> Vec<String> {
-        vec!["/bin/true".into()]
+        vec!["true".into()]
     }
 
     #[tokio::test]
