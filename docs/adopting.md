@@ -235,7 +235,9 @@ second undoes the adoption.
 ## Caveats
 
 - **Reformatting detection is a heuristic.** Only comments, blank lines and trailing whitespace are ignored, for
-  common config formats. Anything else counts as an edit and goes to the overlay.
+  common config formats. Anything else counts as an edit and goes to the overlay. A file that may contain a multi-line
+  string (TOML `"""`/`'''`, YAML `|`/`>` blocks, `\` line continuations, Forge `<` lists) is always treated as edited,
+  because a `#` line or blank line inside such a string is data, not formatting.
 - **Overlay files are frozen.** A config adopt copied into the overlay wins over every future pack version, even when
   the pack author fixes something in it. The plan shows a conflict notice when upstream changes such a file; merge by
   hand, or delete the overlay copy to take the pack's version.
