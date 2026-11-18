@@ -5,27 +5,54 @@
 //! "Terminology" for the domain model.
 
 use std::env;
+use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{PackError, Result};
+use crate::providers::curseforge::endpoint::{CfEndpoint, normalize_base};
+pub use crate::providers::modrinth::mrpack::OptionalFiles;
 
 /// Pack provider for a profile's upstream pack.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
+    /// A CurseForge modpack
+    #[value(name = "curseforge")]
     CurseForge,
+    /// A Modrinth modpack
+    Modrinth,
+    /// Server-pack archives on this machine
     Local,
 }
 
+impl ProviderKind {
+    /// The name used in profiles and on the command line.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProviderKind::CurseForge => "curseforge",
+            ProviderKind::Modrinth => "modrinth",
+            ProviderKind::Local => "local",
+        }
+    }
+}
+
+impl fmt::Display for ProviderKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Kind of server controller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum ControllerKind {
+    /// An AMP instance, driven through ampinstmgr
     Amp,
+    /// Custom status, stop and start commands
     Command,
 }
 
@@ -53,11 +80,45 @@ pub const DEFAULT_DROP_DIR: &str = "packs";
 #[derive(Debug, Clone)]
 pub struct PackSection {
     pub provider: ProviderKind,
-    pub project_id: u32,
+    /// The provider's project id: a number for CurseForge, a base62 id for
+    /// Modrinth, and absent for local archives.
+    pub project_id: Option<String>,
     pub slug: Option<String>,
-    /// Local archive path (zip file or directory of zips) for the `local`
+    /// Local archive path (.zip or .mrpack file, or a directory of them) for the `local`
     /// provider. When omitted, `local` packs update from `<server root>/packs`.
     pub archive: Option<PathBuf>,
+    /// CurseForge API base URL (normalized), overriding the default choice
+    /// between the official API and the community proxy.
+    pub api_base: Option<String>,
+    /// Whether Modrinth files marked optional on the server are installed.
+    pub optional_files: OptionalFiles,
+}
+
+#[cfg(test)]
+impl PackSection {
+    /// A CurseForge pack section for tests.
+    pub fn curseforge(project_id: u32) -> Self {
+        PackSection {
+            provider: ProviderKind::CurseForge,
+            project_id: Some(project_id.to_string()),
+            slug: None,
+            archive: None,
+            api_base: None,
+            optional_files: OptionalFiles::default(),
+        }
+    }
+
+    /// A local-archive pack section for tests.
+    pub fn local(archive: Option<PathBuf>) -> Self {
+        PackSection {
+            provider: ProviderKind::Local,
+            project_id: None,
+            slug: None,
+            archive,
+            api_base: None,
+            optional_files: OptionalFiles::default(),
+        }
+    }
 }
 
 /// Where the mirrored local overlay lives.
@@ -97,24 +158,96 @@ pub struct ServerProfile {
 }
 
 impl ServerProfile {
-    /// The CurseForge API key to use for this profile.
+    /// The CurseForge API key configured for this profile, if any.
     ///
-    /// `$CF_API_KEY` wins when set; otherwise the profile's stored, encrypted
-    /// key is decrypted; otherwise the shared, machine-wide key stored with
-    /// `packctl apikey --global` is used. Returns `Ok(None)` when no key is
-    /// available.
+    /// A key is optional: without one, packctl uses the community proxy
+    /// (see [`ServerProfile::curseforge_endpoint`]). `$CF_API_KEY` wins when
+    /// set; otherwise the profile's stored, encrypted key is decrypted;
+    /// otherwise the shared, machine-wide key stored with `packctl apikey
+    /// --global` is used. Returns `Ok(None)` when no key is available, and
+    /// an error when a stored key cannot be decrypted.
     pub fn curseforge_api_key(&self) -> Result<Option<String>> {
+        self.curseforge_api_key_with_source().map(|(key, _)| key)
+    }
+
+    /// The CurseForge API key and where it came from, in the order described
+    /// at [`ServerProfile::curseforge_api_key`]. Returns
+    /// `(None, KeySource::None)` when no key is configured. The key is
+    /// trimmed whatever its source, so one stored or exported with stray
+    /// whitespace still forms a valid `x-api-key` header.
+    pub fn curseforge_api_key_with_source(&self) -> Result<(Option<String>, KeySource)> {
+        let trimmed = |key: String| key.trim().to_string();
         let from_env = std::env::var("CF_API_KEY")
             .ok()
             .filter(|key| !key.trim().is_empty());
         if let Some(key) = from_env {
-            return Ok(Some(key));
+            return Ok((Some(trimmed(key)), KeySource::Env));
         }
         if let Some(blob) = &self.secrets.api_key {
-            return crate::config::secrets::decrypt_string(blob).map(Some);
+            let key = crate::config::secrets::decrypt_string(blob)?;
+            return Ok((Some(trimmed(key)), KeySource::Profile));
         }
-        crate::config::secrets::load_global_key()
+        Ok(match crate::config::secrets::load_global_key()? {
+            Some(key) => (Some(trimmed(key)), KeySource::Global),
+            None => (None, KeySource::None),
+        })
     }
+
+    /// The CurseForge API base configured for this profile:
+    /// `$PACKCTL_CF_API_BASE` when set, else the profile's `[pack] api_base`.
+    /// `None` means the default choice (official API with a key, community
+    /// proxy without).
+    pub fn curseforge_api_base(&self) -> Option<String> {
+        env_api_base().or_else(|| self.pack.api_base.clone())
+    }
+
+    /// The CurseForge endpoint this profile talks to, with the key attached
+    /// only where it may be sent (see [`resolve_endpoint`]).
+    ///
+    /// [`resolve_endpoint`]: crate::providers::curseforge::endpoint::resolve_endpoint
+    pub fn curseforge_endpoint(&self) -> Result<CfEndpoint> {
+        use crate::providers::curseforge::endpoint::{ENV_PROXY_SEND_KEY, resolve_endpoint};
+        let send_key = env::var(ENV_PROXY_SEND_KEY).is_ok_and(|value| value.trim() == "1");
+        resolve_endpoint(
+            env_api_base().as_deref(),
+            self.pack.api_base.as_deref(),
+            self.curseforge_api_key()?,
+            send_key,
+        )
+    }
+}
+
+/// Where a profile's CurseForge API key comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    /// The `$CF_API_KEY` environment variable.
+    Env,
+    /// The encrypted key stored in the profile file.
+    Profile,
+    /// The shared, machine-wide key (`packctl apikey --global`).
+    Global,
+    /// No key is configured.
+    None,
+}
+
+impl KeySource {
+    /// A short description for `packctl apikey --show`.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            KeySource::Env => "from CF_API_KEY environment variable",
+            KeySource::Profile => "stored in profile (encrypted)",
+            KeySource::Global => "shared global key",
+            KeySource::None => "none",
+        }
+    }
+}
+
+/// `$PACKCTL_CF_API_BASE`, when set to a non-blank value.
+fn env_api_base() -> Option<String> {
+    env::var(crate::providers::curseforge::endpoint::ENV_API_BASE)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// Raw TOML shape of a profile file, before validation and path resolution.
@@ -137,11 +270,42 @@ struct RawServer {
 #[derive(Debug, Deserialize)]
 struct RawPack {
     provider: ProviderKind,
-    #[serde(default)]
-    project_id: u32,
+    #[serde(default, deserialize_with = "de_project_id")]
+    project_id: Option<String>,
     slug: Option<String>,
     #[serde(default)]
     archive: Option<PathBuf>,
+    /// CurseForge API base override; validated and normalized at load time.
+    #[serde(default)]
+    api_base: Option<String>,
+    /// Modrinth optional server files: `include` (default) or `exclude`.
+    #[serde(default)]
+    optional_files: OptionalFiles,
+}
+
+/// A project id as written in a profile: a TOML integer (CurseForge) or a
+/// string (any provider).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum IdRepr {
+    Int(u64),
+    Str(String),
+}
+
+/// Reads `project_id` as text. `0` and blank strings mean "not set", so
+/// older profiles that wrote `project_id = 0` keep loading.
+fn de_project_id<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match Option::<IdRepr>::deserialize(deserializer)? {
+        None | Some(IdRepr::Int(0)) => None,
+        Some(IdRepr::Int(n)) => Some(n.to_string()),
+        Some(IdRepr::Str(s)) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -229,18 +393,92 @@ pub fn list_profiles() -> Result<Vec<ServerProfile>> {
 }
 
 /// Prints the configured server profiles for `packctl list`.
+///
+/// Global profiles are shown as a table; a `.packctl.toml` in the current
+/// directory is mentioned below it.
 pub fn list_cli() -> Result<()> {
     let profiles = list_profiles()?;
     if profiles.is_empty() {
-        println!("No server profiles configured.");
-        println!("Create a profile in {}", profile_dir()?.display());
-        return Ok(());
+        outln!("No server profiles configured.");
+        outln!("Create a profile in {}", profile_dir()?.display());
+    } else {
+        let rows: Vec<[String; 4]> = profiles
+            .iter()
+            .map(|profile| {
+                [
+                    profile.name.clone(),
+                    profile.pack.provider.to_string(),
+                    profile_project(profile),
+                    profile.server.root.display().to_string(),
+                ]
+            })
+            .collect();
+        out!("{}", profile_table(&rows));
     }
-    println!("Server profiles");
-    for profile in &profiles {
-        println!("  {}", profile.name);
+    if let Ok(cwd) = env::current_dir()
+        && let Some(line) = local_profile_line(&cwd)
+    {
+        outln!();
+        outln!("{line}");
     }
     Ok(())
+}
+
+/// The project a profile follows: its id, else its slug, else `-`.
+fn profile_project(profile: &ServerProfile) -> String {
+    profile
+        .pack
+        .project_id
+        .clone()
+        .or_else(|| profile.pack.slug.clone())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// Renders the `packctl list` table: a header and one row per profile, with
+/// every column but the last padded to its widest cell.
+fn profile_table(rows: &[[String; 4]]) -> String {
+    const HEADER: [&str; 4] = ["NAME", "PROVIDER", "PROJECT", "SERVER ROOT"];
+    let mut widths = HEADER.map(|title| title.chars().count());
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let render = |cells: [&str; 4]| {
+        let mut line = String::new();
+        for (index, cell) in cells.iter().enumerate() {
+            if index + 1 == cells.len() {
+                line.push_str(cell);
+            } else {
+                line.push_str(cell);
+                let pad = widths[index] - cell.chars().count() + 2;
+                line.push_str(&" ".repeat(pad));
+            }
+        }
+        line.trim_end().to_string() + "\n"
+    };
+    let mut out = render(HEADER);
+    for row in rows {
+        out.push_str(&render([&row[0], &row[1], &row[2], &row[3]]));
+    }
+    out
+}
+
+/// The `Local profile here: …` line for `packctl list`, when `dir` holds a
+/// `.packctl.toml`.
+fn local_profile_line(dir: &Path) -> Option<String> {
+    match load_local_profile(dir) {
+        Ok(Some(profile)) => Some(format!(
+            "Local profile here: {} ({} {})",
+            profile.name,
+            profile.pack.provider,
+            profile_project(&profile)
+        )),
+        Ok(None) => None,
+        Err(err) => Some(format!(
+            "Local profile here: {LOCAL_PROFILE} could not be loaded: {err}"
+        )),
+    }
 }
 
 /// File name of a profile stored inside the server root.
@@ -254,11 +492,28 @@ pub const LOCAL_PROFILE: &str = ".packctl.toml";
 /// without registering anything globally.
 pub fn resolve_profile(server: Option<&str>) -> Result<ServerProfile> {
     if let Some(name) = server {
-        return load_profile(name);
+        return load_profile(name).map_err(|err| match env::current_dir() {
+            Ok(cwd) => with_local_profile_hint(err, name, &cwd),
+            Err(_) => err,
+        });
     }
     let cwd =
         env::current_dir().map_err(|err| PackError::io("determine current directory", err))?;
     resolve_local_profile_in(&cwd)
+}
+
+/// Adds a hint to a missing named profile when `cwd` holds a local profile:
+/// the user most likely meant `name` as a version (`packctl plan 1.2.0`).
+fn with_local_profile_hint(err: PackError, name: &str, cwd: &Path) -> PackError {
+    match err {
+        PackError::NotFound(message) if cwd.join(LOCAL_PROFILE).is_file() => {
+            PackError::NotFound(format!(
+                "{message}\nhint: '{name}' was read as a profile name; to target a version of \
+                 the local profile use --to {name}"
+            ))
+        }
+        other => other,
+    }
 }
 
 fn resolve_local_profile_in(cwd: &Path) -> Result<ServerProfile> {
@@ -318,7 +573,13 @@ impl RawProfile {
             root: resolve_against_config(config_dir, &self.server.root)?,
         };
         self.pack.validate()?;
+        let api_base = match self.pack.api_base.as_deref().map(str::trim) {
+            Some(base) if !base.is_empty() => Some(normalize_base(base)?),
+            _ => None,
+        };
         let pack = PackSection {
+            api_base,
+            optional_files: self.pack.optional_files,
             provider: self.pack.provider,
             project_id: self.pack.project_id,
             slug: self.pack.slug,
@@ -349,10 +610,35 @@ impl RawProfile {
 impl RawPack {
     fn validate(&self) -> Result<()> {
         match self.provider {
-            ProviderKind::CurseForge if self.project_id == 0 => Err(PackError::Config(
-                "pack provider 'curseforge' requires a non-zero 'project_id'".to_string(),
-            )),
-            _ => Ok(()),
+            ProviderKind::CurseForge => {
+                let numeric = self
+                    .project_id
+                    .as_deref()
+                    .and_then(|id| id.parse::<u32>().ok())
+                    .is_some_and(|id| id != 0);
+                if numeric {
+                    Ok(())
+                } else {
+                    Err(PackError::Config(
+                        "pack provider 'curseforge' requires a numeric, non-zero 'project_id'"
+                            .to_string(),
+                    ))
+                }
+            }
+            ProviderKind::Modrinth => {
+                let has_slug = self
+                    .slug
+                    .as_deref()
+                    .is_some_and(|slug| !slug.trim().is_empty());
+                if self.project_id.is_some() || has_slug {
+                    Ok(())
+                } else {
+                    Err(PackError::Config(
+                        "pack provider 'modrinth' requires 'project_id' (or 'slug')".to_string(),
+                    ))
+                }
+            }
+            ProviderKind::Local => Ok(()),
         }
     }
 }
@@ -410,10 +696,12 @@ pub struct ProfileDraft {
     pub name: String,
     pub server_root: PathBuf,
     pub provider: ProviderKind,
-    pub project_id: u32,
+    /// The provider's project id; written as a TOML integer for CurseForge
+    /// and as a string otherwise, and left out when `None`.
+    pub project_id: Option<String>,
     /// Human-friendly pack identifier; written only when non-empty.
     pub slug: Option<String>,
-    /// Local archive path (zip file or directory of zips) when the provider is
+    /// Local archive path (.zip or .mrpack file, or a directory of them) when the provider is
     /// `local`.
     pub archive: Option<PathBuf>,
     pub overlay_path: PathBuf,
@@ -424,6 +712,10 @@ pub struct ProfileDraft {
     pub command: Option<CommandConfig>,
     /// Encrypted secrets to store with the profile.
     pub secrets: Option<SecretsSection>,
+    /// CurseForge API base override (`[pack] api_base`); left out when `None`.
+    pub api_base: Option<String>,
+    /// Modrinth optional server files; left out when it is the default.
+    pub optional_files: OptionalFiles,
 }
 
 /// Writes a new profile `<name>.toml` into the profile directory.
@@ -488,9 +780,11 @@ fn profile_write_from_draft(draft: &ProfileDraft) -> ProfileWrite {
         },
         pack: PackWrite {
             provider: draft.provider,
-            project_id: draft.project_id,
+            project_id: project_id_write(draft.provider, draft.project_id.as_deref()),
             slug: draft.slug.clone(),
             archive: draft.archive.clone(),
+            api_base: draft.api_base.clone(),
+            optional_files: draft.optional_files,
         },
         overlay: OverlayWrite {
             path: draft.overlay_path.clone(),
@@ -645,16 +939,33 @@ struct ServerWrite {
 #[derive(Debug, Serialize)]
 struct PackWrite {
     provider: ProviderKind,
-    #[serde(skip_serializing_if = "is_zero")]
-    project_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_id: Option<ProjectIdWrite>,
     #[serde(skip_serializing_if = "Option::is_none")]
     slug: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     archive: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_base: Option<String>,
+    #[serde(skip_serializing_if = "OptionalFiles::is_default")]
+    optional_files: OptionalFiles,
 }
 
-fn is_zero(value: &u32) -> bool {
-    *value == 0
+/// How a project id is written: CurseForge ids stay TOML integers so
+/// profiles keep their historical shape; other ids are strings.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ProjectIdWrite {
+    Int(u32),
+    Str(String),
+}
+
+fn project_id_write(provider: ProviderKind, id: Option<&str>) -> Option<ProjectIdWrite> {
+    let id = id.map(str::trim).filter(|id| !id.is_empty())?;
+    match (provider, id.parse::<u32>()) {
+        (ProviderKind::CurseForge, Ok(number)) => Some(ProjectIdWrite::Int(number)),
+        _ => Some(ProjectIdWrite::Str(id.to_string())),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -703,6 +1014,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     #[test]
     fn full_profile_parses() {
         let _lock = env_lock();
@@ -737,7 +1049,7 @@ instance = "ATM10"
             PathBuf::from("/home/amp/.ampdata/instances/ATM10/Minecraft")
         );
         assert_eq!(profile.pack.provider, ProviderKind::CurseForge);
-        assert_eq!(profile.pack.project_id, 925200);
+        assert_eq!(profile.pack.project_id.as_deref(), Some("925200"));
         assert_eq!(profile.pack.slug.as_deref(), Some("atm10"));
         assert_eq!(profile.overlay.path, dir.path().join("overlay"));
         assert_eq!(profile.controller.kind, ControllerKind::Amp);
@@ -782,13 +1094,14 @@ instance = "x"
 
         let profile = load_profile("sb4").unwrap();
         assert_eq!(profile.pack.provider, ProviderKind::Local);
-        assert_eq!(profile.pack.project_id, 0);
+        assert_eq!(profile.pack.project_id, None);
         assert_eq!(
             profile.pack.archive.as_deref(),
             Some(dir.path().join("packs/server-pack.zip").as_path())
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_profile_without_archive_defaults_to_packs_drop_folder() {
         let _lock = env_lock();
@@ -832,7 +1145,7 @@ instance = "x"
         let dir = tempfile::tempdir().unwrap();
         let _guard = EnvGuard::set("PACKCTL_HOME", dir.path().as_os_str());
 
-        let content = "[server]\nroot = \"/srv/mc\"\n\n[pack]\nprovider = \"modrinth\"\nproject_id = 1\n\n[overlay]\npath = \"overlay\"\n\n"
+        let content = "[server]\nroot = \"/srv/mc\"\n\n[pack]\nprovider = \"ftb\"\nproject_id = 1\n\n[overlay]\npath = \"overlay\"\n\n"
             .to_string()
             + AMP_CONTROLLER;
         fs::write(dir.path().join("bad.toml"), content).unwrap();
@@ -842,6 +1155,297 @@ instance = "x"
             matches!(err, PackError::Parse(_)),
             "expected Parse error, got {err:?}"
         );
+    }
+
+    /// Loads a profile whose `[pack]` section is `pack` (a TOML body).
+    fn load_with_pack(pack: &str) -> Result<ServerProfile> {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("PACKCTL_HOME", dir.path().as_os_str());
+        let content = format!(
+            "[server]\nroot = \"/srv/mc\"\n\n[pack]\n{pack}\n\n[overlay]\npath = \"overlay\"\n\n{AMP_CONTROLLER}"
+        );
+        fs::write(dir.path().join("p.toml"), content).unwrap();
+        load_profile("p")
+    }
+
+    fn curseforge_draft(project_id: &str) -> ProfileDraft {
+        ProfileDraft {
+            name: "atm10".to_string(),
+            server_root: PathBuf::from("/srv/atm10"),
+            provider: ProviderKind::CurseForge,
+            project_id: Some(project_id.to_string()),
+            slug: Some("all-the-mods-10".to_string()),
+            archive: None,
+            overlay_path: PathBuf::from("/srv/atm10/overlay"),
+            controller: ControllerKind::Amp,
+            instance: Some("ATM10".to_string()),
+            command: None,
+            secrets: None,
+            api_base: None,
+            optional_files: OptionalFiles::default(),
+        }
+    }
+
+    #[test]
+    fn integer_project_id_still_loads_and_round_trips_as_integer() {
+        let _lock = env_lock();
+        let profile = load_with_pack("provider = \"curseforge\"\nproject_id = 925200").unwrap();
+        assert_eq!(profile.pack.project_id.as_deref(), Some("925200"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let draft = ProfileDraft {
+            project_id: profile.pack.project_id.clone(),
+            ..curseforge_draft("ignored")
+        };
+        let path = write_local_profile(&draft, false, dir.path()).unwrap();
+        let content = fs::read_to_string(path).unwrap();
+        assert!(content.contains("project_id = 925200\n"), "{content}");
+        assert!(!content.contains("\"925200\""), "{content}");
+    }
+
+    #[test]
+    fn optional_files_round_trip_and_default_not_written() {
+        let _lock = env_lock();
+        let profile = load_with_pack("provider = \"modrinth\"\nproject_id = \"5FFgwNNP\"").unwrap();
+        assert_eq!(profile.pack.optional_files, OptionalFiles::Include);
+        let profile = load_with_pack(
+            "provider = \"modrinth\"\nproject_id = \"5FFgwNNP\"\noptional_files = \"exclude\"",
+        )
+        .unwrap();
+        assert_eq!(profile.pack.optional_files, OptionalFiles::Exclude);
+        assert!(matches!(
+            load_with_pack(
+                "provider = \"modrinth\"\nproject_id = \"5FFgwNNP\"\noptional_files = \"maybe\""
+            ),
+            Err(PackError::Parse(_))
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let draft = ProfileDraft {
+            provider: ProviderKind::Modrinth,
+            project_id: Some("5FFgwNNP".to_string()),
+            ..curseforge_draft("1")
+        };
+        let path = write_local_profile(&draft, true, dir.path()).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("optional_files"), "{content}");
+
+        let draft = ProfileDraft {
+            optional_files: OptionalFiles::Exclude,
+            ..draft
+        };
+        write_local_profile(&draft, true, dir.path()).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("optional_files = \"exclude\""),
+            "{content}"
+        );
+        let loaded = load_local_profile(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.pack.optional_files, OptionalFiles::Exclude);
+    }
+
+    #[test]
+    fn string_project_id_loads_for_modrinth() {
+        let _lock = env_lock();
+        let profile =
+            load_with_pack("provider = \"modrinth\"\nproject_id = \" 1KVo5zza \"").unwrap();
+        assert_eq!(profile.pack.provider, ProviderKind::Modrinth);
+        assert_eq!(profile.pack.project_id.as_deref(), Some("1KVo5zza"));
+
+        // Written back as a string, never as a number, even when it looks
+        // numeric.
+        let dir = tempfile::tempdir().unwrap();
+        for (id, expected) in [
+            ("1KVo5zza", "project_id = \"1KVo5zza\""),
+            ("123", "project_id = \"123\""),
+        ] {
+            let draft = ProfileDraft {
+                provider: ProviderKind::Modrinth,
+                project_id: Some(id.to_string()),
+                ..curseforge_draft("1")
+            };
+            let path = write_local_profile(&draft, true, dir.path()).unwrap();
+            let content = fs::read_to_string(&path).unwrap();
+            assert!(content.contains(expected), "{content}");
+            let loaded = load_local_profile(dir.path()).unwrap().unwrap();
+            assert_eq!(loaded.pack.project_id.as_deref(), Some(id));
+        }
+    }
+
+    #[test]
+    fn curseforge_string_numeric_id_accepted() {
+        let _lock = env_lock();
+        let profile = load_with_pack("provider = \"curseforge\"\nproject_id = \"925200\"").unwrap();
+        assert_eq!(profile.pack.project_id.as_deref(), Some("925200"));
+    }
+
+    #[test]
+    fn curseforge_non_numeric_id_rejected() {
+        let _lock = env_lock();
+        for pack in [
+            "provider = \"curseforge\"\nproject_id = \"atm10\"",
+            "provider = \"curseforge\"\nproject_id = 0",
+            "provider = \"curseforge\"\nproject_id = \"\"",
+            "provider = \"curseforge\"\nproject_id = 99999999999",
+            "provider = \"curseforge\"",
+        ] {
+            let err = load_with_pack(pack).unwrap_err();
+            assert!(
+                matches!(&err, PackError::Config(m)
+                    if m == "pack provider 'curseforge' requires a numeric, non-zero 'project_id'"),
+                "{pack}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn modrinth_requires_project_id_or_slug() {
+        let _lock = env_lock();
+        for pack in [
+            "provider = \"modrinth\"",
+            "provider = \"modrinth\"\nslug = \"  \"",
+            "provider = \"modrinth\"\nproject_id = \"\"",
+        ] {
+            let err = load_with_pack(pack).unwrap_err();
+            assert!(
+                matches!(&err, PackError::Config(m)
+                    if m == "pack provider 'modrinth' requires 'project_id' (or 'slug')"),
+                "{pack}: {err:?}"
+            );
+        }
+        let by_slug =
+            load_with_pack("provider = \"modrinth\"\nslug = \"fabulously-optimized\"").unwrap();
+        assert_eq!(by_slug.pack.project_id, None);
+        assert_eq!(by_slug.pack.slug.as_deref(), Some("fabulously-optimized"));
+    }
+
+    #[test]
+    fn written_curseforge_profile_byte_identical_to_previous_format() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_local_profile(&curseforge_draft("925200"), false, dir.path()).unwrap();
+        let content = fs::read_to_string(path).unwrap();
+        // The exact shape packctl wrote while project ids were integers.
+        assert_eq!(
+            content,
+            "name = \"atm10\"\n\n[server]\nroot = \"/srv/atm10\"\n\n[pack]\nprovider = \"curseforge\"\nproject_id = 925200\nslug = \"all-the-mods-10\"\n\n[overlay]\npath = \"/srv/atm10/overlay\"\n\n[controller]\ntype = \"amp\"\ninstance = \"ATM10\"\n"
+        );
+    }
+
+    #[test]
+    fn api_base_loads_and_validates() {
+        let _lock = env_lock();
+        let profile = load_with_pack(
+            "provider = \"curseforge\"\nproject_id = 925200\napi_base = \"https://cf.example/v1/\"",
+        )
+        .unwrap();
+        assert_eq!(profile.pack.api_base.as_deref(), Some("https://cf.example"));
+
+        let profile =
+            load_with_pack("provider = \"curseforge\"\nproject_id = 925200\napi_base = \"  \"")
+                .unwrap();
+        assert_eq!(profile.pack.api_base, None);
+
+        for bad in [
+            "http://cf.example",
+            "https://api.curse.tools/v1/cf",
+            "https://user:pw@cf.example",
+        ] {
+            let err = load_with_pack(&format!(
+                "provider = \"curseforge\"\nproject_id = 925200\napi_base = \"{bad}\""
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(&err, PackError::Config(m) if m.starts_with("invalid CurseForge API base")),
+                "{bad}: {err:?}"
+            );
+        }
+
+        // A written api_base round-trips; absent, nothing is written.
+        let dir = tempfile::tempdir().unwrap();
+        let draft = ProfileDraft {
+            api_base: Some("https://cf.example".to_string()),
+            optional_files: OptionalFiles::default(),
+            ..curseforge_draft("925200")
+        };
+        let path = write_local_profile(&draft, false, dir.path()).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("api_base = \"https://cf.example\""),
+            "{content}"
+        );
+        let loaded = load_local_profile(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.pack.api_base.as_deref(), Some("https://cf.example"));
+    }
+
+    #[test]
+    fn curseforge_api_base_env_overrides_profile() {
+        use crate::providers::curseforge::endpoint::{CfEndpointMode, ENV_API_BASE};
+
+        let _lock = env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("PACKCTL_HOME", home.path().as_os_str());
+        let _key = EnvGuard::set("CF_API_KEY", std::ffi::OsStr::new(""));
+        let _base = EnvGuard::set(ENV_API_BASE, std::ffi::OsStr::new(""));
+
+        let mut profile = load_with_pack(
+            "provider = \"curseforge\"\nproject_id = 925200\napi_base = \"https://profile.example\"",
+        )
+        .unwrap();
+        assert_eq!(
+            profile.curseforge_api_base().as_deref(),
+            Some("https://profile.example")
+        );
+        assert_eq!(
+            profile.curseforge_endpoint().unwrap().base_url,
+            "https://profile.example"
+        );
+
+        let _env = EnvGuard::set(ENV_API_BASE, std::ffi::OsStr::new("https://env.example/v1"));
+        assert_eq!(
+            profile.curseforge_api_base().as_deref(),
+            Some("https://env.example/v1")
+        );
+        let endpoint = profile.curseforge_endpoint().unwrap();
+        assert_eq!(endpoint.base_url, "https://env.example");
+        assert_eq!(endpoint.mode, CfEndpointMode::Custom);
+
+        // Neither set: no key means the community proxy.
+        let _env = EnvGuard::set(ENV_API_BASE, std::ffi::OsStr::new(""));
+        profile.pack.api_base = None;
+        assert_eq!(profile.curseforge_api_base(), None);
+        assert_eq!(
+            profile.curseforge_endpoint().unwrap().mode,
+            CfEndpointMode::Proxy
+        );
+    }
+
+    #[test]
+    fn update_secret_in_file_preserves_integer_project_id() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_local_profile(&curseforge_draft("925200"), false, dir.path()).unwrap();
+
+        update_secret_in_file(&path, Some("v1:c2VjcmV0")).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("project_id = 925200\n"), "{content}");
+        let profile = load_local_profile(dir.path()).unwrap().unwrap();
+        assert_eq!(profile.pack.project_id.as_deref(), Some("925200"));
+        assert_eq!(profile.secrets.api_key.as_deref(), Some("v1:c2VjcmV0"));
+    }
+
+    #[test]
+    fn provider_kind_names_match_profile_spelling() {
+        for kind in [
+            ProviderKind::CurseForge,
+            ProviderKind::Modrinth,
+            ProviderKind::Local,
+        ] {
+            let serialized = toml::Value::try_from(kind).unwrap();
+            assert_eq!(serialized.as_str(), Some(kind.as_str()));
+            assert_eq!(kind.to_string(), kind.as_str());
+        }
     }
 
     #[test]
@@ -1035,6 +1639,7 @@ timeout_ms = 30000
         assert_eq!(command.timeout_ms, Some(30000));
     }
 
+    #[cfg(unix)]
     #[test]
     fn write_profile_round_trips_amp() {
         let _lock = env_lock();
@@ -1045,7 +1650,7 @@ timeout_ms = 30000
             name: "atm10".to_string(),
             server_root: PathBuf::from("/srv/atm10"),
             provider: ProviderKind::CurseForge,
-            project_id: 925200,
+            project_id: Some("925200".to_string()),
             slug: Some("all-the-mods-10".to_string()),
             archive: None,
             overlay_path: PathBuf::from("/srv/atm10/overlay"),
@@ -1053,6 +1658,8 @@ timeout_ms = 30000
             instance: Some("ATM10".to_string()),
             command: None,
             secrets: None,
+            api_base: None,
+            optional_files: OptionalFiles::default(),
         };
 
         let path = write_profile(&draft, false).unwrap();
@@ -1062,7 +1669,7 @@ timeout_ms = 30000
         assert_eq!(profile.name, "atm10");
         assert_eq!(profile.server.root, PathBuf::from("/srv/atm10"));
         assert_eq!(profile.pack.provider, ProviderKind::CurseForge);
-        assert_eq!(profile.pack.project_id, 925200);
+        assert_eq!(profile.pack.project_id.as_deref(), Some("925200"));
         assert_eq!(profile.pack.slug.as_deref(), Some("all-the-mods-10"));
         assert_eq!(profile.overlay.path, PathBuf::from("/srv/atm10/overlay"));
         assert_eq!(profile.controller.kind, ControllerKind::Amp);
@@ -1080,7 +1687,7 @@ timeout_ms = 30000
             name: "mc".to_string(),
             server_root: PathBuf::from("/srv/mc"),
             provider: ProviderKind::CurseForge,
-            project_id: 1,
+            project_id: Some("1".to_string()),
             slug: None,
             archive: None,
             overlay_path: PathBuf::from("/srv/mc/overlay"),
@@ -1108,6 +1715,8 @@ timeout_ms = 30000
                 timeout_ms: Some(30000),
             }),
             secrets: None,
+            api_base: None,
+            optional_files: OptionalFiles::default(),
         };
 
         write_profile(&draft, false).unwrap();
@@ -1130,7 +1739,7 @@ timeout_ms = 30000
             name: "atm10".to_string(),
             server_root: PathBuf::from("/srv/atm10"),
             provider: ProviderKind::CurseForge,
-            project_id: 1,
+            project_id: Some("1".to_string()),
             slug: None,
             archive: None,
             overlay_path: PathBuf::from("/srv/atm10/overlay"),
@@ -1138,6 +1747,8 @@ timeout_ms = 30000
             instance: Some("ATM10".to_string()),
             command: None,
             secrets: None,
+            api_base: None,
+            optional_files: OptionalFiles::default(),
         };
 
         write_profile(&draft, false).unwrap();
@@ -1151,6 +1762,7 @@ timeout_ms = 30000
         write_profile(&draft, true).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn write_profile_round_trips_local() {
         let _lock = env_lock();
@@ -1161,7 +1773,7 @@ timeout_ms = 30000
             name: "sb4".to_string(),
             server_root: PathBuf::from("/srv/sb4"),
             provider: ProviderKind::Local,
-            project_id: 0,
+            project_id: None,
             slug: None,
             archive: Some(PathBuf::from("/packs/server-pack.zip")),
             overlay_path: PathBuf::from("/srv/sb4/overlay"),
@@ -1169,6 +1781,8 @@ timeout_ms = 30000
             instance: Some("Stoneblock401".to_string()),
             command: None,
             secrets: None,
+            api_base: None,
+            optional_files: OptionalFiles::default(),
         };
 
         let path = write_profile(&draft, false).unwrap();
@@ -1201,7 +1815,7 @@ timeout_ms = 30000
             name: "../escape".to_string(),
             server_root: PathBuf::from("/srv"),
             provider: ProviderKind::CurseForge,
-            project_id: 1,
+            project_id: Some("1".to_string()),
             slug: None,
             archive: None,
             overlay_path: PathBuf::from("/srv/overlay"),
@@ -1209,6 +1823,8 @@ timeout_ms = 30000
             instance: Some("x".to_string()),
             command: None,
             secrets: None,
+            api_base: None,
+            optional_files: OptionalFiles::default(),
         };
 
         let err = write_profile(&draft, false).unwrap_err();
@@ -1229,7 +1845,7 @@ timeout_ms = 30000
             name: "my-server".to_string(),
             server_root: PathBuf::from("."),
             provider: ProviderKind::CurseForge,
-            project_id: 925200,
+            project_id: Some("925200".to_string()),
             slug: None,
             archive: None,
             overlay_path: PathBuf::from("overlay"),
@@ -1237,6 +1853,8 @@ timeout_ms = 30000
             instance: Some("my-server".to_string()),
             command: None,
             secrets: None,
+            api_base: None,
+            optional_files: OptionalFiles::default(),
         };
 
         let path = write_local_profile(&draft, false, dir.path()).unwrap();
@@ -1250,6 +1868,7 @@ timeout_ms = 30000
         assert_eq!(profile.controller.instance.as_deref(), Some("my-server"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_profile_uses_local_file_without_server_name() {
         let _lock = env_lock();
@@ -1266,6 +1885,28 @@ timeout_ms = 30000
             .unwrap();
         assert_eq!(profile.name, expected);
         assert_eq!(profile.server.root, PathBuf::from("/srv/mc"));
+    }
+
+    #[test]
+    fn missing_named_profile_hints_at_to_when_a_local_profile_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = || PackError::NotFound("profile '1.2.0' not found in x".to_string());
+
+        let err = with_local_profile_hint(missing(), "1.2.0", dir.path());
+        assert_eq!(err.to_string(), "profile '1.2.0' not found in x");
+
+        fs::write(dir.path().join(LOCAL_PROFILE), base_toml(AMP_CONTROLLER)).unwrap();
+        let err = with_local_profile_hint(missing(), "1.2.0", dir.path());
+        assert!(matches!(err, PackError::NotFound(_)));
+        assert_eq!(
+            err.to_string(),
+            "profile '1.2.0' not found in x\nhint: '1.2.0' was read as a profile name; to \
+             target a version of the local profile use --to 1.2.0"
+        );
+
+        // Other errors pass through unchanged.
+        let err = with_local_profile_hint(PackError::Parse("bad".into()), "x", dir.path());
+        assert!(matches!(err, PackError::Parse(_)));
     }
 
     #[test]
@@ -1322,6 +1963,7 @@ timeout_ms = 30000
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn curseforge_api_key_prefers_env_over_stored() {
         let _lock = env_lock();
@@ -1332,7 +1974,7 @@ timeout_ms = 30000
             name: "atm10".to_string(),
             server_root: PathBuf::from("/srv/atm10"),
             provider: ProviderKind::CurseForge,
-            project_id: 1,
+            project_id: Some("1".to_string()),
             slug: None,
             archive: None,
             overlay_path: PathBuf::from("/srv/atm10/overlay"),
@@ -1342,6 +1984,8 @@ timeout_ms = 30000
             secrets: Some(SecretsSection {
                 api_key: Some(crate::config::secrets::encrypt_string("stored-key").unwrap()),
             }),
+            api_base: None,
+            optional_files: OptionalFiles::default(),
         };
         write_profile(&draft, false).unwrap();
 
@@ -1358,6 +2002,7 @@ timeout_ms = 30000
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn curseforge_api_key_falls_back_to_shared_global_key() {
         let _lock = env_lock();
@@ -1368,7 +2013,7 @@ timeout_ms = 30000
             name: "atm10".to_string(),
             server_root: PathBuf::from("/srv/atm10"),
             provider: ProviderKind::CurseForge,
-            project_id: 1,
+            project_id: Some("1".to_string()),
             slug: None,
             archive: None,
             overlay_path: PathBuf::from("/srv/atm10/overlay"),
@@ -1376,6 +2021,8 @@ timeout_ms = 30000
             instance: Some("x".to_string()),
             command: None,
             secrets: None,
+            api_base: None,
+            optional_files: OptionalFiles::default(),
         };
         write_profile(&draft, false).unwrap();
         let profile = load_profile("atm10").unwrap();
@@ -1407,6 +2054,101 @@ timeout_ms = 30000
         assert_eq!(
             with_own.curseforge_api_key().unwrap().as_deref(),
             Some("env-key")
+        );
+    }
+    #[test]
+    fn table_rendering_pads_columns() {
+        let rows = [
+            [
+                "atm10".to_string(),
+                "curseforge".to_string(),
+                "925200".to_string(),
+                "/srv/atm10".to_string(),
+            ],
+            [
+                "cobblemon-server".to_string(),
+                "modrinth".to_string(),
+                "cobblemon-modpack".to_string(),
+                "/srv/cobble".to_string(),
+            ],
+        ];
+        assert_eq!(
+            profile_table(&rows),
+            "NAME              PROVIDER    PROJECT            SERVER ROOT\n\
+             atm10             curseforge  925200             /srv/atm10\n\
+             cobblemon-server  modrinth    cobblemon-modpack  /srv/cobble\n"
+        );
+        // Headers set the minimum width.
+        let short = [[
+            "a".to_string(),
+            "local".to_string(),
+            "-".to_string(),
+            "/r".to_string(),
+        ]];
+        assert_eq!(
+            profile_table(&short),
+            "NAME  PROVIDER  PROJECT  SERVER ROOT\na     local     -        /r\n"
+        );
+    }
+
+    #[test]
+    fn profile_project_prefers_id_then_slug() {
+        let _lock = env_lock();
+        let by_id =
+            load_with_pack("provider = \"curseforge\"\nproject_id = 925200\nslug = \"atm10\"")
+                .unwrap();
+        assert_eq!(profile_project(&by_id), "925200");
+        let by_slug =
+            load_with_pack("provider = \"modrinth\"\nslug = \"fabulously-optimized\"").unwrap();
+        assert_eq!(profile_project(&by_slug), "fabulously-optimized");
+        let local = load_with_pack("provider = \"local\"").unwrap();
+        assert_eq!(profile_project(&local), "-");
+    }
+
+    #[test]
+    fn local_profile_line_names_the_local_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(local_profile_line(dir.path()), None);
+        write_local_profile(&curseforge_draft("925200"), false, dir.path()).unwrap();
+        assert_eq!(
+            local_profile_line(dir.path()).as_deref(),
+            Some("Local profile here: atm10 (curseforge 925200)")
+        );
+        fs::write(dir.path().join(LOCAL_PROFILE), "not toml [").unwrap();
+        let broken = local_profile_line(dir.path()).unwrap();
+        assert!(
+            broken.starts_with("Local profile here: .packctl.toml could not be loaded"),
+            "{broken}"
+        );
+    }
+
+    #[test]
+    fn every_example_profile_loads() {
+        let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        let mut loaded = Vec::new();
+        for entry in fs::read_dir(&examples).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+                continue;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            fs::copy(&path, dir.path().join(LOCAL_PROFILE)).unwrap();
+            let profile = load_local_profile(dir.path())
+                .unwrap_or_else(|err| panic!("{} does not load: {err}", path.display()))
+                .unwrap();
+            loaded.push((
+                path.file_stem().unwrap().to_string_lossy().into_owned(),
+                profile.pack.provider,
+            ));
+        }
+        loaded.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            loaded,
+            [
+                ("atm10".to_string(), ProviderKind::CurseForge),
+                ("local".to_string(), ProviderKind::Local),
+                ("modrinth".to_string(), ProviderKind::Modrinth),
+            ]
         );
     }
 }

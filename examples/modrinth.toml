@@ -1,0 +1,44 @@
+# packctl server profile for a Modrinth modpack (Cobblemon).
+#
+# Copy this file to <name>.toml in the profile directory, or save it as
+# .packctl.toml in the server root, and edit the paths. `packctl create
+# --source https://modrinth.com/modpack/<slug>` writes one for you.
+#
+# Modrinth needs no API key. packctl installs the server side of the pack's
+# .mrpack; it does not install the mod loader itself.
+
+name = "cobblemon"
+
+[server]
+# The live server directory. Relative paths resolve against this file's folder.
+root = "/srv/minecraft/cobblemon"
+
+[pack]
+provider = "modrinth"
+# The Modrinth project id (a string) or, instead, its slug. Both are shown on
+# the project page; `packctl create` fills them in.
+project_id = "5FFgwNNP"
+slug = "cobblemon-fabric"
+# Files the pack marks optional on servers are installed by default; set
+# "exclude" to skip them.
+# optional_files = "include"
+
+[overlay]
+# Your own files (extra mods, edited configs). They mirror the server root and
+# are copied over the pack after every update.
+path = "/srv/minecraft/cobblemon/overlay"
+
+[controller]
+type = "command"
+
+# Each command is an argv array that packctl runs directly, never through a
+# shell. When you need shell features, call the shell yourself, as status does.
+# status: exit 0 = running, 1 = stopped, anything else = unknown.
+# `systemctl is-active` exits 3 (not 1) for an inactive unit, so the status
+# command maps every non-zero exit to 1; without that, packctl would never see
+# the server as stopped and every update would time out after stopping it.
+[controller.command]
+status = ["sh", "-c", "systemctl is-active --quiet minecraft-cobblemon || exit 1"]
+stop = ["systemctl", "stop", "minecraft-cobblemon"]
+start = ["systemctl", "start", "minecraft-cobblemon"]
+timeout_ms = 120000

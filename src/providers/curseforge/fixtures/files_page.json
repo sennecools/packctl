@@ -1,0 +1,85 @@
+{
+  "data": [
+    {
+      "id": 6900001,
+      "gameId": 432,
+      "modId": 925200,
+      "isAvailable": true,
+      "displayName": "All the Mods 10-4.12",
+      "fileName": "All the Mods 10-4.12.zip",
+      "releaseType": 1,
+      "fileStatus": 4,
+      "hashes": [
+        { "value": "19b0a7e2a1b3c4d5e6f708192a3b4c5d6e7f8091", "algo": 1 },
+        { "value": "802f6a1b2c3d4e5f60718293a4b5c6d7", "algo": 2 }
+      ],
+      "fileDate": "2026-11-10T18:15:28.950Z",
+      "fileLength": 1835264,
+      "downloadCount": 10234,
+      "downloadUrl": "https://edge.forgecdn.net/files/6900/1/All%20the%20Mods%2010-4.12.zip",
+      "gameVersions": ["NeoForge", "1.21.1"],
+      "dependencies": [],
+      "alternateFileId": 0,
+      "isServerPack": false,
+      "serverPackFileId": 6900002,
+      "fileFingerprint": 3612872210,
+      "modules": []
+    },
+    {
+      "id": 6900002,
+      "gameId": 432,
+      "modId": 925200,
+      "isAvailable": true,
+      "displayName": "Server Files: 4.12",
+      "fileName": "ServerFiles-4.12.zip",
+      "releaseType": 1,
+      "fileStatus": 4,
+      "hashes": [
+        { "value": "5f2b1c0a9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b", "algo": 1 },
+        { "value": "0c1d2e3f405162738495a6b7c8d9eaf0", "algo": 2 }
+      ],
+      "fileDate": "2026-11-10T18:16:02.103Z",
+      "fileLength": 412345678,
+      "downloadCount": 2048,
+      "downloadUrl": "https://edge.forgecdn.net/files/6900/2/ServerFiles-4.12.zip",
+      "gameVersions": ["1.21.1"],
+      "dependencies": [],
+      "alternateFileId": 0,
+      "isServerPack": true,
+      "serverPackFileId": null,
+      "fileFingerprint": 2771044387,
+      "modules": []
+    },
+    {
+      "id": 6800001,
+      "gameId": 432,
+      "modId": 925200,
+      "isAvailable": true,
+      "displayName": "All the Mods 10-4.11",
+      "fileName": "All the Mods 10-4.11.zip",
+      "releaseType": 2,
+      "fileStatus": 4,
+      "hashes": [
+        { "value": "aa11bb22cc33dd44ee55ff6677889900aabbccdd", "algo": 1 },
+        { "value": "aabbccddeeff00112233445566778899", "algo": 2 }
+      ],
+      "fileDate": "2026-10-01T09:00:00.000Z",
+      "fileLength": 1830000,
+      "downloadCount": 99999,
+      "downloadUrl": null,
+      "gameVersions": ["NeoForge", "1.21.1"],
+      "dependencies": [],
+      "alternateFileId": 0,
+      "isServerPack": false,
+      "serverPackFileId": 6800002,
+      "fileFingerprint": 1029384756,
+      "modules": []
+    }
+  ],
+  "pagination": {
+    "index": 50,
+    "pageSize": 50,
+    "resultCount": 3,
+    "totalCount": 53
+  }
+}

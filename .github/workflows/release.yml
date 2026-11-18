@@ -6,89 +6,97 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  quality:
-    name: quality
+  ci:
+    name: ci
+    uses: ./.github/workflows/ci.yml
+
+  verify-version:
+    name: verify version
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
-      - name: Toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Format
-        run: cargo fmt --check
-
-      - name: Lint
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Test
-        run: cargo test --all-features
+      - name: Tag matches Cargo.toml and CHANGELOG.md
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag $GITHUB_REF_NAME != Cargo.toml version $crate"
+            exit 1
+          fi
+          if ! grep -Fq "## [$crate]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$crate]' section"
+            exit 1
+          fi
+          if grep -Fq "## [$crate] - Unreleased" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md still dates $crate as Unreleased; set the release date"
+            exit 1
+          fi
 
   build:
-    name: build-${{ matrix.target }}
-    needs: quality
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-    steps:
-      - uses: actions/checkout@v5
+    name: build
+    needs: [ci, verify-version]
+    uses: ./.github/workflows/build.yml
 
-      - name: Toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install musl cross toolchain
-        uses: taiki-e/setup-cross-toolchain-action@v1
-        with:
-          target: ${{ matrix.target }}
-
-      - name: Build static musl release
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Stage archive
-        run: |
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/packctl" "dist/packctl-${{ matrix.target }}"
-          tar -C dist -czf "dist/packctl-${{ matrix.target }}.tar.gz" "packctl-${{ matrix.target }}"
-
-      - name: Upload archive
-        uses: actions/upload-artifact@v5
-        with:
-          name: packctl-${{ matrix.target }}
-          path: dist/packctl-${{ matrix.target }}.tar.gz
-          if-no-files-found: error
-
-  release:
+  publish:
     name: publish
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - name: Download archives
-        uses: actions/download-artifact@v5
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v5
         with:
           path: artifacts
           pattern: packctl-*
           merge-multiple: true
 
-      - name: Generate checksums
+      - name: Checksums
         working-directory: artifacts
-        run: sha256sum packctl-*.tar.gz > SHA256SUMS
+        run: |
+          sha256sum packctl-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
 
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
+      - uses: actions/attest-build-provenance@v3
         with:
+          subject-path: artifacts/packctl-*.tar.gz
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # Everything between this version's heading and the next one.
+          awk -v v="$version" '
+            index($0, "## [" v "]") == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found && /^\[[^]]*\]: / { exit }
+            found { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          test -s RELEASE_NOTES.md || { echo "::error::empty release notes for $version"; exit 1; }
+          cat RELEASE_NOTES.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
           files: |
             artifacts/packctl-*.tar.gz
             artifacts/SHA256SUMS
-          generate_release_notes: true

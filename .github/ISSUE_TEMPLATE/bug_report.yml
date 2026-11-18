@@ -1,0 +1,80 @@
+name: Bug report
+description: Something in packctl does not work as expected.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug.
+
+        **Remove API keys before posting.** Check every log and config you paste
+        for `x-api-key`, `api_key` or other secrets, and replace them with `REDACTED`.
+        For security problems, use [private vulnerability reporting](https://github.com/sennecools/packctl/security/advisories/new) instead.
+
+  - type: input
+    id: version
+    attributes:
+      label: packctl version
+      description: Output of `packctl --version`.
+      placeholder: "packctl 0.2.0 (x86_64-unknown-linux-musl)"
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Distribution and architecture
+      description: For example `Debian 12, x86_64` or `Ubuntu 24.04, aarch64`.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      options:
+        - CurseForge
+        - Modrinth
+        - Local
+    validations:
+      required: true
+
+  - type: dropdown
+    id: controller
+    attributes:
+      label: Controller
+      options:
+        - AMP
+        - command
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you ran, what you expected, and what happened instead.
+      placeholder: |
+        1. Ran `packctl plan --to 1.2`
+        2. Expected ...
+        3. Got ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`packctl doctor` output"
+      description: Run `packctl doctor` for the affected server and paste the output. Remove API keys.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Other output or profile
+      description: Full command output (`-v` where available) and your `.packctl.toml`, with secrets removed.
+      render: text
+    validations:
+      required: false

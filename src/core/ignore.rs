@@ -20,9 +20,10 @@
 //!
 //! A pattern matches the named relative path and, because it is a directory
 //! prefix, everything beneath it. `*` and `?` match within a single path
-//! segment, `**` matches zero or more segments. Absolute paths, `..`
-//! components, and empty segments are rejected. Negation (`!`) is not
-//! supported in V1.
+//! segment, `**` matches zero or more segments. Patterns are always relative
+//! to the server root: leading and trailing `/` are dropped, so `/mods` is
+//! `mods`. `.` and `..` components and empty segments (`a//b`) are
+//! rejected. Negation (`!`) is not supported in V1.
 
 use std::path::Path;
 
@@ -118,15 +119,181 @@ fn segment_matches(pattern: &str, text: &str) -> bool {
     dp[m][n]
 }
 
+/// Cuts an inline comment: a `#` that follows whitespace starts a comment,
+/// so `config/luckperms   # the whole tree` is the rule `config/luckperms`.
+/// A `#` inside a segment (`config/a#b`) is part of the path.
+fn strip_inline_comment(line: &str) -> &str {
+    let mut previous_is_space = false;
+    for (index, c) in line.char_indices() {
+        if c == '#' && previous_is_space {
+            return &line[..index];
+        }
+        previous_is_space = c.is_whitespace();
+    }
+    line
+}
+
+/// First line of the block `packctl adopt` maintains in `.packctlignore`.
+pub const ADOPT_BLOCK_BEGIN: &str = "# >>> packctl adopt";
+/// Last line of the block `packctl adopt` maintains in `.packctlignore`.
+pub const ADOPT_BLOCK_END: &str = "# <<< packctl adopt";
+
+/// Longest block comment kept, in characters.
+const MAX_BLOCK_COMMENT: usize = 120;
+
+/// Replaces packctl's managed block in a `.packctlignore` file, or appends it.
+///
+/// The block is `{BEGIN}\n# {comment}\n{rules, one per line}\n{END}\n`. When
+/// `existing` already has a block (from its BEGIN line to its END line,
+/// inclusive) that block is replaced in place; otherwise the block is
+/// appended after one blank line. Everything outside the block is kept byte
+/// for byte, so rules the admin wrote are never touched.
+///
+/// `comment` comes partly from the provider (a version name), so control
+/// characters are replaced and its length is capped; a comment or rule that
+/// would contain one of the block markers, or a rule spanning lines, is
+/// refused rather than written.
+pub fn upsert_managed_block(existing: &str, comment: &str, rules: &[String]) -> Result<String> {
+    let comment: String = comment
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_BLOCK_COMMENT)
+        .collect();
+    let comment = comment.trim();
+    let has_marker =
+        |text: &str| text.contains(ADOPT_BLOCK_BEGIN) || text.contains(ADOPT_BLOCK_END);
+    if has_marker(comment) {
+        return Err(PackError::Config(
+            "refusing to write a .packctlignore block whose comment contains the block markers"
+                .to_string(),
+        ));
+    }
+    for rule in rules {
+        if rule.contains(['\n', '\r']) || has_marker(rule) || rule.trim().starts_with('#') {
+            return Err(PackError::Config(format!(
+                "refusing to write the .packctlignore rule '{}'",
+                rule.escape_debug()
+            )));
+        }
+    }
+
+    let mut block = format!("{ADOPT_BLOCK_BEGIN}\n");
+    if !comment.is_empty() {
+        block.push_str(&format!("# {comment}\n"));
+    }
+    for rule in rules {
+        block.push_str(rule);
+        block.push('\n');
+    }
+    block.push_str(ADOPT_BLOCK_END);
+    block.push('\n');
+
+    if let Some((start, end)) = managed_block_span(existing) {
+        let mut out = String::with_capacity(existing.len() + block.len());
+        out.push_str(&existing[..start]);
+        out.push_str(&block);
+        out.push_str(&existing[end..]);
+        return Ok(out);
+    }
+    let mut out = existing.to_string();
+    if !out.is_empty() {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+    }
+    out.push_str(&block);
+    Ok(out)
+}
+
+/// True when `content` holds packctl's managed block.
+pub fn has_managed_block(content: &str) -> bool {
+    managed_block_span(content).is_some()
+}
+
+/// `content` without packctl's managed block: only the rules the admin wrote.
+///
+/// `packctl adopt` classifies a server against these, not the whole file, so
+/// re-adopting re-derives every path the previous block covered (and the
+/// new block, which replaces the old one, protects them again) instead of
+/// skipping them and dropping their rules.
+pub fn without_managed_block(content: &str) -> std::borrow::Cow<'_, str> {
+    match managed_block_span(content) {
+        Some((start, end)) => {
+            let mut out = String::with_capacity(content.len() - (end - start));
+            out.push_str(&content[..start]);
+            out.push_str(&content[end..]);
+            std::borrow::Cow::Owned(out)
+        }
+        None => std::borrow::Cow::Borrowed(content),
+    }
+}
+
+/// Byte range of the managed block: from the start of its BEGIN line to just
+/// after its END line (including that line's newline, when there is one).
+fn managed_block_span(content: &str) -> Option<(usize, usize)> {
+    let mut offset = 0;
+    let mut start = None;
+    for line in content.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\n', '\r']);
+        match start {
+            None if text == ADOPT_BLOCK_BEGIN => start = Some(offset),
+            Some(begin) if text == ADOPT_BLOCK_END => {
+                return Some((begin, offset + line.len()));
+            }
+            _ => {}
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// The rule that ignores exactly `rel` (a forward-slash relative path) and
+/// everything beneath it, or `None` when no rule can express it safely.
+///
+/// A path containing `#`, `*` or `?`, or a segment with leading or trailing
+/// whitespace, cannot be written as a literal rule. The rule must also
+/// round-trip: parsed back, it must ignore `rel` and must not ignore a
+/// sibling whose last segment differs.
+pub fn rule_for_exact_path(rel: &str) -> Option<String> {
+    let rel = rel.replace('\\', "/");
+    if rel.is_empty()
+        || rel.contains(['#', '*', '?', '\n', '\r'])
+        || rel.starts_with('!')
+        || rel.chars().any(char::is_control)
+    {
+        return None;
+    }
+    if rel
+        .split('/')
+        .any(|segment| segment.is_empty() || segment.trim() != segment)
+    {
+        return None;
+    }
+    let rules = parse_rules(&rel).ok()?;
+    if !rules.is_ignored(Path::new(&rel)) {
+        return None;
+    }
+    let sibling = format!("{rel}~sibling");
+    if rules.is_ignored(Path::new(&sibling)) {
+        return None;
+    }
+    Some(rel)
+}
+
 /// Parses the contents of a `.packctlignore` file.
 ///
-/// Blank lines and `#` comments are skipped. Leading and trailing slashes are
-/// ignored. Rejects absolute paths, `.`/`..` components, empty segments, and
-/// negation patterns with a contextual error.
+/// Blank lines and `#` comments are skipped, including a comment that
+/// follows a rule after whitespace. Leading and trailing slashes are
+/// dropped, so every rule is relative to the server root. Rejects `.`/`..`
+/// components, empty segments, and negation patterns with a contextual
+/// error.
 pub fn parse_rules(content: &str) -> Result<IgnoreRules> {
     let mut patterns = Vec::new();
     for (index, raw) in content.lines().enumerate() {
-        let line = raw.trim();
+        let line = strip_inline_comment(raw).trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -245,6 +412,112 @@ mod tests {
             parse_rules("/abs/path\n").is_ok(),
             "leading slash is allowed"
         );
+    }
+
+    #[test]
+    fn inline_comments_after_whitespace_are_stripped() {
+        let parsed = rules("config/luckperms/   # the whole directory tree\nmods/a#b.jar\n");
+        assert!(parsed.is_ignored(Path::new("config/luckperms/x.db")));
+        assert!(parsed.is_ignored(Path::new("config/luckperms")));
+        // A '#' inside a segment is part of the path.
+        assert!(parsed.is_ignored(Path::new("mods/a#b.jar")));
+        assert!(rules("config/a\t# tab comment\n").is_ignored(Path::new("config/a/b")));
+    }
+
+    #[test]
+    fn upsert_block_appends_then_replaces_idempotently() {
+        let user = "# my rules\nconfig/luckperms\n";
+        let once =
+            upsert_managed_block(user, "2026-11-18 8.2 (id 1)", &["mods/x.jar".into()]).unwrap();
+        assert_eq!(
+            once,
+            "# my rules\nconfig/luckperms\n\n# >>> packctl adopt\n# 2026-11-18 8.2 (id 1)\nmods/x.jar\n# <<< packctl adopt\n"
+        );
+        let twice =
+            upsert_managed_block(&once, "2026-11-18 8.2 (id 1)", &["mods/x.jar".into()]).unwrap();
+        assert_eq!(twice, once, "same input is a no-op");
+
+        let replaced = upsert_managed_block(&once, "later", &["a/b".into(), "c/d".into()]).unwrap();
+        assert_eq!(
+            replaced,
+            "# my rules\nconfig/luckperms\n\n# >>> packctl adopt\n# later\na/b\nc/d\n# <<< packctl adopt\n"
+        );
+        let parsed = parse_rules(&replaced).unwrap();
+        assert!(parsed.is_ignored(Path::new("a/b")));
+        assert!(!parsed.is_ignored(Path::new("mods/x.jar")));
+
+        assert_eq!(
+            upsert_managed_block("", "c", &["x/y".into()]).unwrap(),
+            "# >>> packctl adopt\n# c\nx/y\n# <<< packctl adopt\n"
+        );
+    }
+
+    #[test]
+    fn preserves_user_rules_outside_block() {
+        let existing = "before/a\n# >>> packctl adopt\n# old\nold/rule\n# <<< packctl adopt\nafter/b   # keep me\r\nno-newline";
+        let out = upsert_managed_block(existing, "new", &["new/rule".into()]).unwrap();
+        assert_eq!(
+            out,
+            "before/a\n# >>> packctl adopt\n# new\nnew/rule\n# <<< packctl adopt\nafter/b   # keep me\r\nno-newline"
+        );
+        // A file without a trailing newline gets one before the block.
+        assert_eq!(
+            upsert_managed_block("a/b", "c", &[]).unwrap(),
+            "a/b\n\n# >>> packctl adopt\n# c\n# <<< packctl adopt\n"
+        );
+    }
+
+    #[test]
+    fn without_managed_block_keeps_only_the_admins_rules() {
+        let existing =
+            "before/a\n# >>> packctl adopt\n# old\nold/rule\n# <<< packctl adopt\nafter/b\n";
+        assert_eq!(without_managed_block(existing), "before/a\nafter/b\n");
+        let rules = parse_rules(&without_managed_block(existing)).unwrap();
+        assert!(rules.is_ignored(Path::new("after/b")));
+        assert!(!rules.is_ignored(Path::new("old/rule")));
+        // No block (or an unterminated one): the file as it is.
+        assert_eq!(without_managed_block("a/b\n"), "a/b\n");
+        let open = "a/b\n# >>> packctl adopt\nc/d\n";
+        assert_eq!(without_managed_block(open), open);
+    }
+
+    #[test]
+    fn block_comment_is_sanitized_and_markers_refused() {
+        let out = upsert_managed_block("", "8.2\nmods\n**", &["a/b".into()]).unwrap();
+        let parsed = parse_rules(&out).unwrap();
+        assert!(!parsed.is_ignored(Path::new("mods/x.jar")), "{out}");
+        assert!(!parsed.is_ignored(Path::new("config/x")), "{out}");
+        assert!(upsert_managed_block("", "x # <<< packctl adopt", &[]).is_err());
+        assert!(upsert_managed_block("", "c", &["a\nb".into()]).is_err());
+        let long = "v".repeat(500);
+        let out = upsert_managed_block("", &long, &[]).unwrap();
+        assert!(out.lines().nth(1).unwrap().len() <= MAX_BLOCK_COMMENT + 2);
+    }
+
+    #[test]
+    fn rule_for_exact_path_rejects_hash_and_glob_chars() {
+        assert_eq!(
+            rule_for_exact_path("config/luckperms").as_deref(),
+            Some("config/luckperms")
+        );
+        assert_eq!(
+            rule_for_exact_path("mods/my mod.jar").as_deref(),
+            Some("mods/my mod.jar")
+        );
+        for bad in [
+            "config/a#b",
+            "config/a #b",
+            "config/*.db",
+            "config/a?.db",
+            "config/ lead",
+            "config/trail ",
+            "!mods/x",
+            "a//b",
+            "../x",
+            "",
+        ] {
+            assert_eq!(rule_for_exact_path(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

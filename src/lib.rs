@@ -7,6 +7,10 @@
 //! The core is host-local and callable programmatically so a future remote
 //! client can invoke the same server-side operations without redesign.
 
+// First, so its macros are in scope in every module below.
+#[macro_use]
+mod output;
+
 pub mod cli;
 pub mod config;
 pub mod controllers;

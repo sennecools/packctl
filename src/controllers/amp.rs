@@ -237,7 +237,7 @@ impl ServerController for AmpController {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::fs;

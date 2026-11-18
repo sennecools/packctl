@@ -1,0 +1,48 @@
+name: demo
+
+# Renders docs/media/demo.gif from docs/demo.tape against the offline fixture
+# in scripts/demo/setup.sh. Manual only, and it never commits: download the
+# artifact and commit the GIF yourself.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  render:
+    name: render demo.gif
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build packctl
+        run: cargo build --locked --release
+
+      - name: Put packctl on PATH
+        run: echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
+
+      - name: Check the demo fixture
+        run: |
+          sh scripts/demo/setup.sh
+          rm -rf /tmp/packctl-demo
+
+      - uses: charmbracelet/vhs-action@v2
+        with:
+          path: docs/demo.tape
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: demo-gif
+          path: docs/media/demo.gif
+          if-no-files-found: error

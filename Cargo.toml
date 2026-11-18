@@ -1,7 +1,15 @@
 [package]
 name = "packctl"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Safely update self-hosted Minecraft modpack servers: upstream pack + local overlay + persistent data"
+license = "MIT"
+repository = "https://github.com/sennecools/packctl"
+readme = "README.md"
+keywords = ["minecraft", "modpack", "curseforge", "modrinth", "server"]
+categories = ["command-line-utilities", "games"]
+exclude = ["/.github", "/docs/media", "/scripts"]
 
 [dependencies]
 aes-gcm = "0.10"
@@ -9,20 +17,31 @@ async-trait = "0.1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+crc32fast = "1"
 dialoguer = "0.11"
 futures = "0.3"
 fs2 = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha1 = "0.10"
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "io-util", "sync", "time", "signal"] }
 toml = "0.8"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
-zip = { version = "2", default-features = false, features = ["deflate", "deflate64"] }
+zip = { version = "9", default-features = false, features = ["deflate", "deflate64"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/packctl-{ target }.tar.gz"
+bin-dir = "packctl-{ target }"
+pkg-fmt = "tgz"

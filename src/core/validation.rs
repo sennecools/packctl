@@ -226,7 +226,7 @@ mod tests {
 
     use super::*;
     use crate::config::profile::{
-        ControllerKind, ControllerSection, OverlaySection, PackSection, ProviderKind, ServerSection,
+        ControllerKind, ControllerSection, OverlaySection, PackSection, ServerSection,
     };
     use crate::controllers::ServerStatus;
     use crate::error::PackError;
@@ -280,12 +280,7 @@ mod tests {
             server: ServerSection {
                 root: root.to_path_buf(),
             },
-            pack: PackSection {
-                provider: ProviderKind::CurseForge,
-                project_id: 1,
-                slug: None,
-                archive: None,
-            },
+            pack: PackSection::curseforge(1),
             overlay: OverlaySection {
                 path: overlay.to_path_buf(),
             },
@@ -430,8 +425,7 @@ mod tests {
             version: PackVersion {
                 id: "1".to_string(),
                 name: "1".to_string(),
-                file_id: None,
-                released: None,
+                ..Default::default()
             },
             root: tmp.path().join("staging"),
             files: vec![PreparedFile {
@@ -439,6 +433,8 @@ mod tests {
                 size: 1024,
                 sha256: "abc".to_string(),
             }],
+            requirements: None,
+            notices: Vec::new(),
         };
 
         let profile = profile(&root, &overlay);

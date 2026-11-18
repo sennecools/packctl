@@ -4,11 +4,17 @@
 //! controllers only through the [`crate::controllers`] interface. It never
 //! knows how CurseForge, AMP, or any other integration works.
 
+pub mod adopt;
+pub mod configdiff;
+pub mod detect;
 pub mod executor;
 pub mod ignore;
+pub mod loader;
+pub mod modid;
 pub mod overlay;
 pub mod ownership;
 pub mod planner;
+pub mod reserved;
 pub mod snapshot;
 pub mod staging;
 pub mod state;

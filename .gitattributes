@@ -1,0 +1,4 @@
+# Shell scripts and VHS tapes run under sh/bash, which choke on CRLF
+# (`set -eu\r`), so keep them LF even in a Windows checkout with autocrlf.
+*.sh   text eol=lf
+*.tape text eol=lf

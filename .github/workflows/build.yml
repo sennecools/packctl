@@ -1,0 +1,96 @@
+name: build
+
+# Reusable release build: static musl binaries for Linux, packaged the way
+# install.sh and cargo-binstall expect (the binary at the archive root as
+# packctl-<target>, next to LICENSE and README.md).
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build (default: the triggering ref)
+        type: string
+        default: ""
+      build_sha:
+        description: Commit stamped into `packctl --version` (empty for tagged releases)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    env:
+      # Job-level so the smoke test reuses the binary instead of rebuilding.
+      PACKCTL_BUILD_SHA: ${{ inputs.build_sha }}
+      PACKCTL_BUILD_TARGET: ${{ matrix.target }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Linker and, for aarch64, a qemu runner for the smoke test.
+      - uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --locked --release --target "$TARGET"
+
+      - name: Smoke test
+        run: cargo run --locked --release --target "$TARGET" -- --version
+
+      - name: Check the binary is static
+        run: |
+          file "target/$TARGET/release/packctl"
+          file "target/$TARGET/release/packctl" | grep -Eq 'static(ally|-pie) linked'
+
+      - name: Archive
+        run: |
+          mkdir -p stage dist
+          cp "target/$TARGET/release/packctl" "stage/packctl-$TARGET"
+          cp LICENSE README.md stage/
+          # Explicit member names (no ./ prefix) so install.sh can extract
+          # exactly packctl-<target>.
+          tar -C stage -czf "dist/packctl-$TARGET.tar.gz" "packctl-$TARGET" LICENSE README.md
+          tar -tzf "dist/packctl-$TARGET.tar.gz"
+
+      - name: Check install.sh can extract the archive
+        run: |
+          out="$(mktemp -d)"
+          # The same member extraction install.sh performs.
+          tar -xzf "dist/packctl-$TARGET.tar.gz" -C "$out" "packctl-$TARGET"
+          test -x "$out/packctl-$TARGET"
+
+      - name: Install with install.sh
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          release="$(mktemp -d)"
+          cp "dist/packctl-$TARGET.tar.gz" "$release/"
+          (cd "$release" && sha256sum "packctl-$TARGET.tar.gz" > SHA256SUMS)
+          PACKCTL_DOWNLOAD_BASE="file://$release" sh install.sh ci-build "$RUNNER_TEMP/bin"
+          "$RUNNER_TEMP/bin/packctl" --version
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: packctl-${{ matrix.target }}
+          path: dist/packctl-${{ matrix.target }}.tar.gz
+          if-no-files-found: error

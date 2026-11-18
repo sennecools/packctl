@@ -1,15 +1,16 @@
 //! `packctl versions` — list available upstream versions for a server.
 
-use crate::core::updater::Updater;
 use crate::error::{PackError, Result};
 use crate::providers::PackVersion;
 
 /// Lists the upstream versions a server's pack can be updated to.
 pub async fn run(server: Option<&str>, json: bool) -> Result<()> {
     let profile = crate::config::profile::resolve_profile(server)?;
-    let updater = Updater::from_profile(&profile)?;
+    let provider = crate::providers::from_profile(&profile)?;
 
-    let versions = updater.provider.list_versions(&updater.pack_ref()).await?;
+    let versions = provider
+        .list_versions(&crate::providers::pack_ref(&profile))
+        .await?;
     if versions.is_empty() {
         return Err(PackError::Provider(format!(
             "no versions available for server '{}'",
@@ -19,25 +20,52 @@ pub async fn run(server: Option<&str>, json: bool) -> Result<()> {
 
     if json {
         let output = versions_json(&versions)?;
-        println!("{output}");
+        outln!("{output}");
     } else {
-        print!("{}", versions_list(&profile.name, &versions));
+        out!("{}", versions_list(&profile.name, &versions));
     }
     Ok(())
 }
 
 /// Renders the human-readable numbered version list.
+///
+/// Each line is `N. name (id ID)`; a version number that differs from the
+/// name is shown after it, and known Minecraft versions and loaders follow
+/// in brackets.
 fn versions_list(server_name: &str, versions: &[PackVersion]) -> String {
     let mut lines = vec![format!("Available versions for {server_name}")];
     lines.extend(
-        versions.iter().enumerate().map(|(index, version)| {
-            format!("  {}. {} (id {})", index + 1, version.name, version.id)
-        }),
+        versions
+            .iter()
+            .enumerate()
+            .map(|(index, version)| format!("  {}. {}", index + 1, version_line(version))),
     );
     lines.join("\n") + "\n"
 }
 
-/// Renders the versions as a JSON array of `{id, name, released}` objects.
+fn version_line(version: &PackVersion) -> String {
+    let mut line = version.name.clone();
+    if let Some(number) = version
+        .number
+        .as_deref()
+        .filter(|number| *number != version.name)
+    {
+        line.push_str(&format!(" · {number}"));
+    }
+    line.push_str(&format!(" (id {})", version.id));
+    let tags: Vec<String> = [&version.game_versions, &version.loaders]
+        .into_iter()
+        .filter(|list| !list.is_empty())
+        .map(|list| list.join(","))
+        .collect();
+    if !tags.is_empty() {
+        line.push_str(&format!(" [{}]", tags.join(" ")));
+    }
+    line
+}
+
+/// Renders the versions as a JSON array of
+/// `{id, name, number, released, game_versions, loaders}` objects.
 fn versions_json(versions: &[PackVersion]) -> Result<String> {
     let items: Vec<serde_json::Value> = versions
         .iter()
@@ -45,7 +73,10 @@ fn versions_json(versions: &[PackVersion]) -> Result<String> {
             serde_json::json!({
                 "id": &version.id,
                 "name": &version.name,
+                "number": &version.number,
                 "released": &version.released,
+                "game_versions": &version.game_versions,
+                "loaders": &version.loaders,
             })
         })
         .collect();
@@ -61,8 +92,8 @@ mod tests {
         PackVersion {
             id: id.to_string(),
             name: name.to_string(),
-            file_id: None,
             released: released.map(str::to_string),
+            ..Default::default()
         }
     }
 
@@ -73,8 +104,34 @@ mod tests {
         let list = versions_list("ATM10", &versions);
 
         assert!(list.contains("Available versions for ATM10"));
-        assert!(list.contains("  1. 4.11.1 (id 123)"));
-        assert!(list.contains("  2. 4.12 (id 124)"));
+        assert!(list.contains("  1. 4.11.1 (id 123)\n"), "{list}");
+        assert!(list.contains("  2. 4.12 (id 124)\n"), "{list}");
+    }
+
+    #[test]
+    fn list_shows_number_and_loaders() {
+        let versions = vec![
+            PackVersion {
+                number: Some("6.4.0".to_string()),
+                game_versions: vec!["1.21.1".to_string(), "1.21".to_string()],
+                loaders: vec!["fabric".to_string()],
+                ..version("tXKSV9ql", "Fabulously Optimized", None)
+            },
+            // A number equal to the name is not repeated.
+            PackVersion {
+                number: Some("2.0".to_string()),
+                loaders: vec!["neoforge".to_string()],
+                ..version("b", "2.0", None)
+            },
+        ];
+
+        let list = versions_list("FO", &versions);
+
+        assert!(
+            list.contains("  1. Fabulously Optimized · 6.4.0 (id tXKSV9ql) [1.21.1,1.21 fabric]\n"),
+            "{list}"
+        );
+        assert!(list.contains("  2. 2.0 (id b) [neoforge]\n"), "{list}");
     }
 
     #[test]
@@ -93,5 +150,28 @@ mod tests {
         assert_eq!(parsed[1]["id"], "124");
         assert_eq!(parsed[1]["name"], "4.12");
         assert!(parsed[1]["released"].is_null());
+    }
+
+    #[test]
+    fn json_includes_new_fields() {
+        let versions = vec![
+            PackVersion {
+                number: Some("6.4.0".to_string()),
+                game_versions: vec!["1.21.1".to_string()],
+                loaders: vec!["fabric".to_string(), "quilt".to_string()],
+                ..version("a", "FO", None)
+            },
+            version("b", "plain", None),
+        ];
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&versions_json(&versions).unwrap()).unwrap();
+
+        assert_eq!(parsed[0]["number"], "6.4.0");
+        assert_eq!(parsed[0]["game_versions"], serde_json::json!(["1.21.1"]));
+        assert_eq!(parsed[0]["loaders"], serde_json::json!(["fabric", "quilt"]));
+        assert!(parsed[1]["number"].is_null());
+        assert_eq!(parsed[1]["game_versions"], serde_json::json!([]));
+        assert_eq!(parsed[1]["loaders"], serde_json::json!([]));
     }
 }
