@@ -1,103 +1,131 @@
 name: rolling
 
+# Publishes main as the `rolling` pre-release once ci passed on it. It reuses
+# ci's verdict instead of running the checks a second time.
+#
+# Only the commit that is still the tip of main is published:
+# - the tag never moves back, even when an older ci run on main is re-run;
+# - under workflow_run, `github.sha` (the commit the provenance attestation
+#   records) is the tip of main when ci finished, so it names the commit that
+#   was built only while that commit is still the tip.
+# A commit that main moved past before its ci finished is skipped; the next
+# green commit publishes instead.
 on:
-  push:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
     branches: [main]
 
 permissions:
-  contents: write
-
-# Only the most recent commit to main should win the rolling build.
-concurrency:
-  group: rolling
-  cancel-in-progress: true
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  quality:
-    name: fmt / clippy / test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - name: Cache
-        uses: Swatinem/rust-cache@v2
-      - name: Formatting
-        run: cargo fmt --check
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Tests
-        run: cargo test --all
-
   build:
-    name: build-${{ matrix.target }}
-    needs: quality
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install musl cross toolchain
-        uses: taiki-e/setup-cross-toolchain-action@v1
-        with:
-          target: ${{ matrix.target }}
-
-      - name: Build static musl release
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Stage archive
-        run: |
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/packctl" "dist/packctl-${{ matrix.target }}"
-          tar -C dist -czf "dist/packctl-${{ matrix.target }}.tar.gz" "packctl-${{ matrix.target }}"
-
-      - name: Upload archive
-        uses: actions/upload-artifact@v5
-        with:
-          name: packctl-${{ matrix.target }}
-          path: dist/packctl-${{ matrix.target }}.tar.gz
-          if-no-files-found: error
+    name: build
+    if: >-
+      github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.head_sha == github.sha
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ github.event.workflow_run.head_sha }}
+      build_sha: ${{ github.event.workflow_run.head_sha }}
 
   publish:
     name: update rolling release
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Job-level, so only runs that built something queue here: a failed or
+    # cancelled ci run never evicts a pending publish. Never cancel a
+    # half-finished publish.
+    concurrency:
+      group: rolling
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha }}
+      BRANCH: ${{ github.event.workflow_run.head_branch }}
     steps:
-      - name: Download archives
-        uses: actions/download-artifact@v5
+      - name: Still the tip of main
+        id: tip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tip="$(gh api "repos/$GITHUB_REPOSITORY/commits/$BRANCH" --jq .sha)"
+          if [ "$tip" = "$SHA" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::$BRANCH is at $tip now; not publishing $SHA over it"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@v5
+        if: steps.tip.outputs.publish == 'true'
         with:
           path: artifacts
           pattern: packctl-*
           merge-multiple: true
 
-      - name: Generate checksums
+      - name: Checksums
+        if: steps.tip.outputs.publish == 'true'
         working-directory: artifacts
-        run: sha256sum packctl-*.tar.gz > SHA256SUMS
+        run: |
+          sha256sum packctl-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
 
-      - name: Publish rolling release
+      - uses: actions/attest-build-provenance@v3
+        if: steps.tip.outputs.publish == 'true'
+        with:
+          subject-path: artifacts/packctl-*.tar.gz
+
+      - name: Move the rolling tag
+        if: steps.tip.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/rolling" -f sha="$SHA" -F force=true \
+            || gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref=refs/tags/rolling -f sha="$SHA"
+
+      # The archives are replaced in place. The old checksums go first, so an
+      # install racing this update fails with "could not download release
+      # checksums" (install.sh then says to retry) rather than a checksum
+      # mismatch; the new SHA256SUMS goes up last, once every archive it
+      # lists is there.
+      - name: Remove the old checksums
+        if: steps.tip.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete-asset rolling SHA256SUMS -R "$GITHUB_REPOSITORY" -y || true
+
+      - name: Upload archives
+        if: steps.tip.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: rolling
           name: rolling (latest main)
-          body: |
-            Continuous build from `main` — not a stable release.
-
-            Commit: ${{ github.sha }}
           prerelease: true
-          files: |
-            artifacts/packctl-*.tar.gz
-            artifacts/SHA256SUMS
+          fail_on_unmatched_files: true
+          body: |
+            Continuous build from `main`, not a stable release.
+            Commit: ${{ github.event.workflow_run.head_sha }}
+          files: artifacts/packctl-*.tar.gz
+
+      - name: Upload checksums
+        if: steps.tip.outputs.publish == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: rolling
+          name: rolling (latest main)
+          prerelease: true
+          fail_on_unmatched_files: true
+          body: |
+            Continuous build from `main`, not a stable release.
+            Commit: ${{ github.event.workflow_run.head_sha }}
+          files: artifacts/SHA256SUMS

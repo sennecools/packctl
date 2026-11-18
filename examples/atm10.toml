@@ -28,15 +28,18 @@ root = "/home/amp/.ampdata/instances/ATM10/Minecraft"
 # ---------------------------------------------------------------------------
 # [pack] — which upstream modpack this server follows.
 #
-# provider:   the pack provider. V1 supports only "curseforge".
+# provider:   "curseforge", "modrinth" or "local".
 # project_id: the provider's project identifier (a number). The ATM10
 #             CurseForge project id is 925200.
 # slug:       optional human-friendly identifier for this pack.
+# api_base:   optional CurseForge endpoint. By default packctl uses the official
+#             API when an API key is set and the community proxy otherwise.
 # ---------------------------------------------------------------------------
 [pack]
 provider = "curseforge"
 project_id = 925200
 slug = "atm10"
+# api_base = "https://api.curse.tools"
 
 # ---------------------------------------------------------------------------
 # [overlay] — your local mirrored overlay.
@@ -48,6 +51,10 @@ slug = "atm10"
 #
 # Put your admin/grief-logging mods, custom config, KubeJS changes, and any
 # managed server.properties here, e.g.:
+#
+# `packctl adopt --apply` only copies into an overlay inside the server root
+# (so `packctl rollback` can remove what it wrote); with an overlay elsewhere,
+# like the one below, it needs --force whenever it has files to copy.
 #
 #   /srv/packctl/overlay/mods/grieflogger.jar
 #   /srv/packctl/overlay/config/MiniMOTD/main.conf

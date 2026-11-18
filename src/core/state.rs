@@ -20,6 +20,45 @@ use crate::error::{PackError, Result};
 pub struct ManagedFile {
     pub sha256: String,
     pub size: u64,
+    /// A local variant accepted as equivalent to `sha256`: the live file was
+    /// only reformatted (comments, whitespace) when the server was adopted.
+    /// While upstream keeps shipping `sha256`, a live file with this hash is
+    /// left alone; once upstream changes the file, the new upstream content
+    /// is written and the alias is dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_sha256: Option<String>,
+}
+
+impl ManagedFile {
+    /// A fingerprint from a SHA-256 hex digest and a size in bytes.
+    pub fn new(sha256: impl Into<String>, size: u64) -> Self {
+        ManagedFile {
+            sha256: sha256.into(),
+            size,
+            local_sha256: None,
+        }
+    }
+
+    /// The same fingerprint with an accepted local variant (see
+    /// [`ManagedFile::local_sha256`]).
+    pub fn with_local(mut self, local_sha256: impl Into<String>) -> Self {
+        self.local_sha256 = Some(local_sha256.into());
+        self
+    }
+}
+
+/// How a hand-installed server was recorded by `packctl adopt`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdoptionRecord {
+    /// When the adoption was applied.
+    pub at: DateTime<Utc>,
+    /// The pack version name the server was recorded as.
+    pub version: String,
+    pub provider_version_id: String,
+    /// Files adopt copied from the server into the overlay (relative paths).
+    pub overlay_added: Vec<String>,
+    /// The `.packctlignore` rules adopt wrote in its managed block.
+    pub ignore_rules: Vec<String>,
 }
 
 /// Everything the updater has persisted about an installed server.
@@ -27,18 +66,49 @@ pub struct ManagedFile {
 pub struct InstalledState {
     pub installed_version: Option<String>,
     pub provider_version_id: Option<String>,
+    /// The provider the recorded version came from (`curseforge`,
+    /// `modrinth`, `local`). Absent in state written by older packctl.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The provider project (id, or slug when there is no id) the recorded
+    /// version belongs to. Absent for local archives and older state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// The Minecraft version the recorded pack version targets, when known.
+    /// Updates to "latest" stay on this Minecraft version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minecraft: Option<String>,
     /// Relative paths (forward slashes) keyed to their file fingerprints.
     pub managed_files: HashMap<String, ManagedFile>,
+    /// Upstream fingerprints of pack paths the overlay owns.
+    ///
+    /// The overlay replaces these paths, so they are not upstream-managed, but
+    /// remembering the upstream content lets every later update tell whether
+    /// upstream changed a file the overlay hides.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub overlay_shadowed: HashMap<String, ManagedFile>,
+    /// Fingerprints of the overlay files as they were last written to the
+    /// server, so a live file changed after that can be told apart from an
+    /// overlay file the admin edited.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub overlay_applied: HashMap<String, ManagedFile>,
     pub last_successful_update: Option<DateTime<Utc>>,
+    /// Set when `packctl adopt` recorded this server. Kept by later updates
+    /// so `status` can say how packctl came to manage it. Absent in state
+    /// written before adoption existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted: Option<AdoptionRecord>,
 }
 
 impl InstalledState {
-    /// True when no version is recorded, no files are managed, and no update
+    /// True when no version is recorded, no files are tracked, and no update
     /// has ever completed.
     pub fn is_empty(&self) -> bool {
         self.installed_version.is_none()
             && self.provider_version_id.is_none()
             && self.managed_files.is_empty()
+            && self.overlay_shadowed.is_empty()
+            && self.overlay_applied.is_empty()
             && self.last_successful_update.is_none()
     }
 }
@@ -56,7 +126,7 @@ pub struct ServerLock {
 
 impl Drop for ServerLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -148,49 +218,55 @@ impl StateStore {
                 PackError::io(format!("create state directory '{}'", parent.display()), e)
             })?;
         }
-        let file_name = self
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "state.json".to_string());
-        for counter in 0u32.. {
-            let tmp = self.path.with_file_name(format!(
-                ".{}.{}.{}.tmp",
-                file_name,
-                std::process::id(),
-                counter
-            ));
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)
-            {
-                Ok(mut file) => {
-                    use std::io::Write;
-                    if let Err(error) = file
-                        .write_all(&json)
-                        .and_then(|_| file.sync_all())
-                        .and_then(|_| std::fs::rename(&tmp, &self.path))
-                    {
-                        let _ = std::fs::remove_file(&tmp);
-                        return Err(PackError::io(
-                            format!("replace state file '{}'", self.path.display()),
-                            error,
-                        ));
-                    }
-                    return Ok(());
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => {
+        write_atomically(&self.path, &json, "state file")
+    }
+}
+
+/// Writes `bytes` to `path` atomically: into a fresh temporary sibling that
+/// is synced and then renamed over `path`, so a reader never sees a partial
+/// file. `what` names the file in errors.
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8], what: &str) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    for counter in 0u32.. {
+        let tmp = path.with_file_name(format!(
+            ".{}.{}.{}.tmp",
+            file_name,
+            std::process::id(),
+            counter
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                if let Err(error) = file
+                    .write_all(bytes)
+                    .and_then(|_| file.sync_all())
+                    .and_then(|_| std::fs::rename(&tmp, path))
+                {
+                    let _ = std::fs::remove_file(&tmp);
                     return Err(PackError::io(
-                        format!("create temporary state file '{}'", tmp.display()),
+                        format!("replace {what} '{}'", path.display()),
                         error,
                     ));
                 }
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(PackError::io(
+                    format!("create temporary {what} '{}'", tmp.display()),
+                    error,
+                ));
             }
         }
-        unreachable!()
     }
+    unreachable!()
 }
 
 #[cfg(test)]
@@ -207,26 +283,149 @@ mod tests {
 
     fn full_state() -> InstalledState {
         let mut files = HashMap::new();
-        files.insert(
-            "mods/a.jar".to_string(),
-            ManagedFile {
-                sha256: "abc123".to_string(),
-                size: 12,
-            },
-        );
-        files.insert(
-            "config/b.toml".to_string(),
-            ManagedFile {
-                sha256: "def456".to_string(),
-                size: 34,
-            },
-        );
+        files.insert("mods/a.jar".to_string(), ManagedFile::new("abc123", 12));
+        files.insert("config/b.toml".to_string(), ManagedFile::new("def456", 34));
         InstalledState {
             installed_version: Some("4.12".to_string()),
             provider_version_id: Some("provider-9".to_string()),
             managed_files: files,
+            overlay_shadowed: [(
+                "config/shadowed.toml".to_string(),
+                ManagedFile::new("upstream", 8),
+            )]
+            .into_iter()
+            .collect(),
+            overlay_applied: [(
+                "config/shadowed.toml".to_string(),
+                ManagedFile::new("overlay", 7),
+            )]
+            .into_iter()
+            .collect(),
+            provider: Some("curseforge".to_string()),
+            project: Some("925200".to_string()),
+            minecraft: Some("1.21.1".to_string()),
             last_successful_update: Some(timestamp("2026-08-14T12:00:00Z")),
+            adopted: Some(AdoptionRecord {
+                at: timestamp("2026-08-01T09:30:00Z"),
+                version: "4.11".to_string(),
+                provider_version_id: "provider-8".to_string(),
+                overlay_added: vec!["mods/extra.jar".to_string()],
+                ignore_rules: vec!["config/luckperms".to_string()],
+            }),
         }
+    }
+
+    #[test]
+    fn state_json_without_adopted_or_local_sha256_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::at(dir.path()).unwrap();
+        std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &store.path,
+            br#"{
+  "installed_version": "4.11",
+  "provider_version_id": "11",
+  "managed_files": {
+    "config/a.toml": { "sha256": "abc", "size": 3 }
+  },
+  "last_successful_update": null
+}"#,
+        )
+        .unwrap();
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.adopted, None);
+        assert_eq!(loaded.managed_files["config/a.toml"].local_sha256, None);
+
+        // Absent values are not written either.
+        let json = serde_json::to_string(&loaded).unwrap();
+        assert!(!json.contains("adopted"), "json: {json}");
+        assert!(!json.contains("local_sha256"), "json: {json}");
+
+        // A recorded alias round-trips.
+        let mut aliased = loaded.clone();
+        aliased.managed_files.insert(
+            "config/a.toml".to_string(),
+            ManagedFile::new("abc", 3).with_local("def"),
+        );
+        store.save(&aliased).unwrap();
+        assert_eq!(
+            store.load().unwrap().managed_files["config/a.toml"]
+                .local_sha256
+                .as_deref(),
+            Some("def")
+        );
+    }
+
+    #[test]
+    fn state_json_without_overlay_shadowed_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::at(dir.path()).unwrap();
+        std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
+        // The layout written before overlay tracking existed.
+        std::fs::write(
+            &store.path,
+            br#"{
+  "installed_version": "4.11",
+  "provider_version_id": "11",
+  "managed_files": {
+    "mods/a.jar": { "sha256": "abc", "size": 3 }
+  },
+  "last_successful_update": "2026-08-14T12:00:00Z"
+}"#,
+        )
+        .unwrap();
+
+        let loaded = store.load().unwrap();
+
+        assert_eq!(loaded.installed_version.as_deref(), Some("4.11"));
+        assert_eq!(loaded.managed_files.len(), 1);
+        assert!(loaded.overlay_shadowed.is_empty());
+        assert!(loaded.overlay_applied.is_empty());
+    }
+
+    #[test]
+    fn state_json_without_provider_fields_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::at(dir.path()).unwrap();
+        std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
+        // The layout written before the provider and project were recorded.
+        std::fs::write(
+            &store.path,
+            br#"{
+  "installed_version": "4.11",
+  "provider_version_id": "11",
+  "managed_files": {},
+  "last_successful_update": null
+}"#,
+        )
+        .unwrap();
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.provider, None);
+        assert_eq!(loaded.project, None);
+        assert_eq!(loaded.provider_version_id.as_deref(), Some("11"));
+
+        // Absent values are not written, so older packctl can still read it.
+        let json = serde_json::to_string(&loaded).unwrap();
+        assert!(!json.contains("\"provider\""), "json: {json}");
+        assert!(!json.contains("\"project\""), "json: {json}");
+    }
+
+    #[test]
+    fn empty_overlay_maps_are_not_serialized() {
+        let json = serde_json::to_string(&InstalledState::default()).unwrap();
+        assert!(!json.contains("overlay_shadowed"), "json: {json}");
+        assert!(!json.contains("overlay_applied"), "json: {json}");
+    }
+
+    #[test]
+    fn overlay_maps_make_state_non_empty() {
+        let mut state = InstalledState::default();
+        state
+            .overlay_shadowed
+            .insert("config/a.toml".to_string(), ManagedFile::new("x", 1));
+        assert!(!state.is_empty());
     }
 
     #[test]

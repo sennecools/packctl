@@ -126,9 +126,12 @@ fn nonzero_exit_error(argv: &[String], what: &str, output: &Output) -> PackError
     } else {
         format!("\nstderr: {}", stderr.trim())
     };
+    let status = match output.status.code() {
+        Some(code) => format!("exited with code {code}"),
+        None => "was terminated by a signal".to_string(),
+    };
     PackError::Controller(format!(
-        "{what} command exited with {:?}: {}{}",
-        output.status.code(),
+        "{what} command {status}: {}{}",
         argv.join(" "),
         detail
     ))
@@ -295,6 +298,10 @@ mod tests {
                     message.contains("boom"),
                     "message should include stderr: {message}"
                 );
+                assert!(
+                    message.contains("stop command exited with code 2: "),
+                    "{message}"
+                );
             }
             other => panic!("expected Controller error, got {other:?}"),
         }
@@ -362,5 +369,54 @@ mod tests {
         assert_eq!(ctrl.status, ["pgrep", "-f", "server.jar"]);
         assert_eq!(ctrl.start, ["systemctl", "start", "mc"]);
         assert_eq!(ctrl.timeout_ms, Some(30_000));
+    }
+}
+
+#[cfg(test)]
+mod exit_message_tests {
+    use std::process::{ExitStatus, Output};
+
+    use super::*;
+
+    #[cfg(unix)]
+    fn status(raw: i32) -> ExitStatus {
+        std::os::unix::process::ExitStatusExt::from_raw(raw)
+    }
+
+    #[cfg(windows)]
+    fn status(raw: u32) -> ExitStatus {
+        std::os::windows::process::ExitStatusExt::from_raw(raw)
+    }
+
+    fn message(status: ExitStatus) -> String {
+        let output = Output {
+            status,
+            stdout: Vec::new(),
+            stderr: b"boom\n".to_vec(),
+        };
+        nonzero_exit_error(&["false".to_string()], "start", &output).to_string()
+    }
+
+    #[test]
+    fn exit_code_is_printed_plainly() {
+        // A wait status of 256 is exit code 1 on Unix.
+        #[cfg(unix)]
+        let failed = status(1 << 8);
+        #[cfg(windows)]
+        let failed = status(1);
+        assert_eq!(
+            message(failed),
+            "controller error: start command exited with code 1: false\nstderr: boom"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_termination_is_named() {
+        // A wait status of 9 is termination by SIGKILL.
+        assert_eq!(
+            message(status(9)),
+            "controller error: start command was terminated by a signal: false\nstderr: boom"
+        );
     }
 }

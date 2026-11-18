@@ -136,7 +136,8 @@ pub fn decrypt_string(blob: &str) -> Result<String> {
             PackError::Config(format!(
                 "stored secret could not be decrypted with the local master key ({}); \
                  it was probably encrypted on another machine or the key file changed. \
-                 Set CF_API_KEY or store the key again with 'packctl apikey'",
+                 Set CF_API_KEY or store the key again with 'packctl apikey', \
+                 or remove the stored key ('packctl apikey --remove') to use the community proxy",
                 key_path.display()
             ))
         })?;

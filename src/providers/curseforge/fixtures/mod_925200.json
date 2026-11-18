@@ -1,0 +1,60 @@
+{
+  "data": {
+    "id": 925200,
+    "gameId": 432,
+    "name": "All the Mods 10 - ATM10",
+    "slug": "all-the-mods-10",
+    "links": {
+      "websiteUrl": "https://www.curseforge.com/minecraft/modpacks/all-the-mods-10",
+      "wikiUrl": "",
+      "issuesUrl": "https://github.com/AllTheMods/ATM-10/issues",
+      "sourceUrl": null
+    },
+    "summary": "All the Mods started out as a private pack for just a few friends of mine that turned into something huge!",
+    "status": 4,
+    "downloadCount": 5123456,
+    "isFeatured": false,
+    "primaryCategoryId": 4472,
+    "categories": [
+      {
+        "id": 4472,
+        "gameId": 432,
+        "name": "Tech",
+        "slug": "tech",
+        "url": "https://www.curseforge.com/minecraft/modpacks/tech",
+        "iconUrl": "https://media.forgecdn.net/avatars/14/479/635596761534662757.png",
+        "dateModified": "2014-05-08T17:44:39.057Z",
+        "isClass": false,
+        "classId": 4471,
+        "parentCategoryId": 4471
+      }
+    ],
+    "classId": 4471,
+    "authors": [
+      { "id": 9876543, "name": "ATMTeam", "url": "https://www.curseforge.com/members/atmteam" }
+    ],
+    "logo": null,
+    "screenshots": [],
+    "mainFileId": 6900001,
+    "latestFiles": [],
+    "latestFilesIndexes": [
+      {
+        "gameVersion": "1.21.1",
+        "fileId": 6900001,
+        "filename": "All the Mods 10-4.12.zip",
+        "releaseType": 1,
+        "gameVersionTypeId": 77784,
+        "modLoader": 6
+      }
+    ],
+    "latestEarlyAccessFilesIndexes": [],
+    "dateCreated": "2024-08-14T21:00:51.633Z",
+    "dateModified": "2026-11-10T18:22:03.417Z",
+    "dateReleased": "2026-11-10T18:15:28.950Z",
+    "allowModDistribution": true,
+    "gamePopularityRank": 12,
+    "isAvailable": true,
+    "thumbsUpCount": 0,
+    "rating": null
+  }
+}

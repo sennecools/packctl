@@ -238,6 +238,9 @@ mod tests {
             removals,
             overlay_changes: Vec::new(),
             notices: Vec::new(),
+            unmanaged_removals: Vec::new(),
+            unmanaged_overwrites: Vec::new(),
+            requirements: None,
         }
     }
 

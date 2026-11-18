@@ -1,0 +1,31 @@
+{
+  "data": {
+    "id": 6900002,
+    "gameId": 432,
+    "modId": 925200,
+    "isAvailable": true,
+    "displayName": "Server Files: 4.12",
+    "fileName": "ServerFiles-4.12.zip",
+    "releaseType": 1,
+    "fileStatus": 4,
+    "hashes": [
+      { "value": "5f2b1c0a9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b", "algo": 1 },
+      { "value": "0c1d2e3f405162738495a6b7c8d9eaf0", "algo": 2 }
+    ],
+    "fileDate": "2026-11-10T18:16:02.103Z",
+    "fileLength": 412345678,
+    "downloadCount": 2048,
+    "downloadUrl": "https://edge.forgecdn.net/files/6900/2/ServerFiles-4.12.zip",
+    "gameVersions": ["1.21.1"],
+    "sortableGameVersions": [],
+    "dependencies": [],
+    "alternateFileId": 0,
+    "isServerPack": true,
+    "serverPackFileId": null,
+    "parentProjectFileId": 6900001,
+    "fileFingerprint": 2771044387,
+    "modules": [
+      { "name": "mods", "fingerprint": 112233445 }
+    ]
+  }
+}

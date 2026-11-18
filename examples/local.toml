@@ -1,0 +1,32 @@
+# packctl server profile that updates from server-pack archives on disk.
+#
+# Use this when packctl cannot download the pack itself, for example when the
+# author disabled third-party downloads on CurseForge. Download the server pack
+# yourself and drop it into the archive folder; `packctl plan` picks it up.
+#
+# Copy this file to <name>.toml in the profile directory, or save it as
+# .packctl.toml in the server root, and edit the paths.
+
+name = "skyblock"
+
+[server]
+# The live server directory. Relative paths resolve against this file's folder.
+root = "/home/amp/.ampdata/instances/Skyblock/Minecraft"
+
+[pack]
+provider = "local"
+# archive: a .zip or .mrpack server pack, or a folder of them. Each archive is
+# one version, named by its file name; the newest is the default target.
+# Defaults to <server root>/packs when omitted.
+archive = "/home/amp/packs/skyblock"
+
+[overlay]
+# Your own files (extra mods, edited configs). They mirror the server root and
+# are copied over the pack after every update.
+path = "/home/amp/.ampdata/instances/Skyblock/overlay"
+
+[controller]
+# A CubeCoders AMP instance, driven through `ampinstmgr`. `instance` must match
+# the instance name in AMP.
+type = "amp"
+instance = "Skyblock"

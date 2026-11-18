@@ -1,0 +1,36 @@
+{
+  "data": [
+    {
+      "id": 328085,
+      "gameId": 432,
+      "name": "Create",
+      "slug": "create",
+      "summary": "Aesthetic Technology that empowers the Player",
+      "status": 4,
+      "downloadCount": 150000000,
+      "classId": 6,
+      "primaryCategoryId": 412,
+      "allowModDistribution": true,
+      "isAvailable": true
+    },
+    {
+      "id": 372026,
+      "gameId": 432,
+      "name": "Create: Above and Beyond",
+      "slug": "create",
+      "summary": "A Create modpack",
+      "status": 4,
+      "downloadCount": 4000000,
+      "classId": 4471,
+      "primaryCategoryId": 4472,
+      "allowModDistribution": false,
+      "isAvailable": true
+    }
+  ],
+  "pagination": {
+    "index": 0,
+    "pageSize": 50,
+    "resultCount": 2,
+    "totalCount": 2
+  }
+}

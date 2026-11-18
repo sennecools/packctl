@@ -37,6 +37,25 @@ pub struct SnapshotManifest {
     /// Every relative path the update planned to touch
     /// (add/modify/remove/overlay).
     pub tracked_paths: Vec<String>,
+    /// True for a snapshot taken before a state refresh: a commit that kept
+    /// the recorded version and changed only the bookkeeping in `state.json`
+    /// (for example re-recording a state file written by an older packctl).
+    /// `rollback` passes over these, because restoring one would undo nothing
+    /// the user can see. A commit that records a different version is a
+    /// normal rollback point even when it changed no server files. Absent in
+    /// manifests written before the field existed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub state_refresh: bool,
+    /// When `packctl rollback` restored this snapshot. A restored snapshot
+    /// is never restored again, and snapshots taken between its creation
+    /// and its restore describe an undone change, so rollback passes over
+    /// them too and the next rollback goes one step further back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored: Option<DateTime<Utc>>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// A rollback point on disk.
@@ -72,6 +91,28 @@ pub fn create_snapshot(
     server_root: &Path,
     files: &[&Path],
     tracked_paths: &[&str],
+) -> Result<Snapshot> {
+    create_snapshot_with(server_root, files, tracked_paths, false)
+}
+
+/// Creates a snapshot before a state refresh, a commit that keeps the
+/// recorded version and changes only `state.json`.
+///
+/// It works like [`create_snapshot`] but marks the manifest `state_refresh`,
+/// so [`rollback_target`] does not let it hide the last real change.
+pub fn create_state_refresh_snapshot(
+    server_root: &Path,
+    files: &[&Path],
+    tracked_paths: &[&str],
+) -> Result<Snapshot> {
+    create_snapshot_with(server_root, files, tracked_paths, true)
+}
+
+fn create_snapshot_with(
+    server_root: &Path,
+    files: &[&Path],
+    tracked_paths: &[&str],
+    state_refresh: bool,
 ) -> Result<Snapshot> {
     let created = Utc::now();
     let snapshots_root = server_root.join(".packctl").join("snapshots");
@@ -109,19 +150,15 @@ pub fn create_snapshot(
         let dest = dir.join("files").join(&rel);
         copy_file(file, &dest)?;
         let sha256 = sha256_file(file)?;
-        manifest_files.insert(
-            rel_str,
-            ManagedFile {
-                sha256,
-                size: metadata.len(),
-            },
-        );
+        manifest_files.insert(rel_str, ManagedFile::new(sha256, metadata.len()));
     }
 
     let manifest = SnapshotManifest {
         created,
         files: manifest_files,
         tracked_paths: tracked_paths.iter().map(|s| s.to_string()).collect(),
+        state_refresh,
+        restored: None,
     };
     write_manifest(&dir, &manifest)?;
 
@@ -233,6 +270,48 @@ pub fn list_snapshots(server_root: &Path) -> Result<Vec<Snapshot>> {
             .then_with(|| b.dir.file_name().cmp(&a.dir.file_name()))
     });
     Ok(snapshots)
+}
+
+/// The snapshot `packctl rollback` restores, from a newest-first list.
+///
+/// This is the newest snapshot, so rollback undoes the last packctl change:
+/// a file update, or a commit that recorded a new version without file
+/// changes (restoring that one reverts only the record). State-refresh
+/// snapshots (see [`create_state_refresh_snapshot`]) kept the recorded
+/// version, so they are passed over in favor of the newest real change.
+/// When every snapshot is a state refresh, the newest one is restored.
+///
+/// Snapshots that were already restored are never chosen again, and neither
+/// are snapshots taken after a restored snapshot but before that rollback
+/// ran: they belong to the change the rollback undid. So a second rollback
+/// goes one step further back instead of replaying the first one.
+/// Returns the chosen snapshot and how many newer state-refresh snapshots
+/// were passed over.
+pub fn rollback_target(snapshots: &[Snapshot]) -> Option<(&Snapshot, usize)> {
+    let undone = |snapshot: &Snapshot| {
+        snapshot.manifest.restored.is_some()
+            || snapshots.iter().any(|other| {
+                other.manifest.restored.is_some_and(|restored| {
+                    other.created <= snapshot.created && snapshot.created < restored
+                })
+            })
+    };
+    let candidates: Vec<&Snapshot> = snapshots.iter().filter(|s| !undone(s)).collect();
+    match candidates
+        .iter()
+        .position(|snapshot| !snapshot.manifest.state_refresh)
+    {
+        Some(index) => Some((candidates[index], index)),
+        None => candidates.first().map(|snapshot| (*snapshot, 0)),
+    }
+}
+
+/// Records on disk that `snapshot` was restored (see
+/// [`SnapshotManifest::restored`]).
+pub fn mark_restored(snapshot: &Snapshot) -> Result<()> {
+    let mut manifest = load_manifest(&snapshot.dir)?;
+    manifest.restored = Some(Utc::now());
+    write_manifest(&snapshot.dir, &manifest)
 }
 
 /// Reads and parses `dir/manifest.json`.
@@ -349,7 +428,7 @@ fn atomic_write(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
     unreachable!()
 }
 
-fn reject_symlink_components(root: &Path, path: &Path) -> Result<()> {
+pub(crate) fn reject_symlink_components(root: &Path, path: &Path) -> Result<()> {
     let rel = path
         .strip_prefix(root)
         .map_err(|_| PackError::UnsafePath(path.to_path_buf()))?;
@@ -539,6 +618,87 @@ mod tests {
     }
 
     #[test]
+    fn state_refresh_flag_round_trips_and_defaults_to_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = make_server(&tmp);
+        let paths = [root.join("mods/a.jar")];
+
+        let files = create_snapshot(&root, &paths_as_ref(&paths), &["mods/a.jar"]).unwrap();
+        let refresh = create_state_refresh_snapshot(&root, &[], &[".packctl/state.json"]).unwrap();
+
+        assert!(!load_manifest(&files.dir).unwrap().state_refresh);
+        assert!(load_manifest(&refresh.dir).unwrap().state_refresh);
+        let on_disk = std::fs::read_to_string(files.manifest_path()).unwrap();
+        assert!(
+            !on_disk.contains("state_refresh"),
+            "file snapshots keep the old manifest shape: {on_disk}"
+        );
+    }
+
+    #[test]
+    fn rollback_target_skips_state_refresh_snapshots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = make_server(&tmp);
+        let paths = [root.join("mods/a.jar")];
+
+        assert!(rollback_target(&[]).is_none());
+
+        let first = create_state_refresh_snapshot(&root, &[], &[".packctl/state.json"]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let list = list_snapshots(&root).unwrap();
+        let (target, skipped) = rollback_target(&list).unwrap();
+        assert_eq!(
+            (target.dir.as_path(), skipped),
+            (first.dir.as_path(), 0),
+            "with only state-refresh snapshots the newest one is restored"
+        );
+
+        let update = create_snapshot(&root, &paths_as_ref(&paths), &["mods/a.jar"]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        create_state_refresh_snapshot(&root, &[], &[".packctl/state.json"]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        create_state_refresh_snapshot(&root, &[], &[".packctl/state.json"]).unwrap();
+
+        let list = list_snapshots(&root).unwrap();
+        let (target, skipped) = rollback_target(&list).unwrap();
+        assert_eq!((target.dir.as_path(), skipped), (update.dir.as_path(), 2));
+    }
+
+    #[test]
+    fn restored_snapshots_and_the_change_they_undid_are_passed_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = make_server(&tmp);
+        let paths = [root.join("mods/a.jar")];
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(15));
+
+        let older = create_snapshot(&root, &paths_as_ref(&paths), &["mods/a.jar"]).unwrap();
+        pause();
+        let newer = create_snapshot(&root, &paths_as_ref(&paths), &["mods/a.jar"]).unwrap();
+        pause();
+        // A refresh recorded after `newer`, undone by the rollback below.
+        create_state_refresh_snapshot(&root, &[], &[".packctl/state.json"]).unwrap();
+        pause();
+
+        let list = list_snapshots(&root).unwrap();
+        let (target, _) = rollback_target(&list).unwrap();
+        assert_eq!(target.dir, newer.dir);
+        mark_restored(target).unwrap();
+
+        // The next rollback goes one step further back.
+        let list = list_snapshots(&root).unwrap();
+        let (target, skipped) = rollback_target(&list).unwrap();
+        assert_eq!((target.dir.as_path(), skipped), (older.dir.as_path(), 0));
+        mark_restored(target).unwrap();
+        assert!(rollback_target(&list_snapshots(&root).unwrap()).is_none());
+
+        // A change made after the rollbacks is a normal target again.
+        pause();
+        let later = create_snapshot(&root, &paths_as_ref(&paths), &["mods/a.jar"]).unwrap();
+        let list = list_snapshots(&root).unwrap();
+        assert_eq!(rollback_target(&list).unwrap().0.dir, later.dir);
+    }
+
+    #[test]
     fn restore_uses_manifest_on_disk() {
         let tmp = tempfile::tempdir().unwrap();
         let root = make_server(&tmp);
@@ -560,6 +720,8 @@ mod tests {
                 created: disk_manifest.created,
                 files: HashMap::new(),
                 tracked_paths: Vec::new(),
+                state_refresh: false,
+                restored: None,
             },
         };
 

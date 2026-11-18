@@ -1,0 +1,23 @@
+# Categories for GitHub's generated release notes. The curated notes come from
+# CHANGELOG.md; this keeps the "Generate release notes" button tidy too.
+changelog:
+  exclude:
+    labels:
+      - ignore-for-release
+  categories:
+    - title: Breaking changes
+      labels:
+        - breaking
+    - title: Features
+      labels:
+        - feature
+        - enhancement
+    - title: Bug fixes
+      labels:
+        - bug
+    - title: Dependencies
+      labels:
+        - dependencies
+    - title: Other changes
+      labels:
+        - "*"

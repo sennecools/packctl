@@ -1,0 +1,41 @@
+{
+  "formatVersion": 1,
+  "game": "minecraft",
+  "versionId": "1.6.1",
+  "name": "Cobblemon Modpack [Fabric]",
+  "summary": "The official Cobblemon modpack.",
+  "files": [
+    {
+      "path": "mods/cobblemon-fabric-1.6.1+1.21.1.jar",
+      "hashes": { "sha1": "0000000000000000000000000000000000000011", "sha512": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000011" },
+      "env": { "client": "required", "server": "required" },
+      "downloads": ["https://cdn.modrinth.com/data/MdwFAVRL/versions/abc/cobblemon-fabric-1.6.1%2B1.21.1.jar"],
+      "fileSize": 31457280
+    },
+    {
+      "path": "mods/sodium-fabric-0.6.5+mc1.21.1.jar",
+      "hashes": { "sha1": "0000000000000000000000000000000000000012", "sha512": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000012" },
+      "env": { "client": "required", "server": "unsupported" },
+      "downloads": ["https://cdn.modrinth.com/data/AANobbMI/versions/def/sodium-fabric-0.6.5%2Bmc1.21.1.jar"],
+      "fileSize": 1048576
+    },
+    {
+      "path": "mods/spark-1.10.109-fabric.jar",
+      "hashes": { "sha1": "0000000000000000000000000000000000000013", "sha512": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000013" },
+      "env": { "client": "optional", "server": "optional" },
+      "downloads": ["https://cdn.modrinth.com/data/l6YH9Als/versions/ghi/spark-1.10.109-fabric.jar"],
+      "fileSize": 524288
+    },
+    {
+      "path": "mods/fabric-api-0.115.0+1.21.1.jar",
+      "hashes": { "sha1": "0000000000000000000000000000000000000014", "sha512": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000014" },
+      "downloads": ["https://github.com/FabricMC/fabric/releases/download/0.115.0/fabric-api-0.115.0%2B1.21.1.jar"],
+      "fileSize": 2097152
+    }
+  ],
+  "dependencies": {
+    "minecraft": "1.21.1",
+    "fabric-loader": "0.16.10",
+    "some-future-key": "1.0"
+  }
+}

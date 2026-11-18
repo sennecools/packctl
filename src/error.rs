@@ -65,4 +65,39 @@ impl PackError {
             source,
         }
     }
+
+    /// The process exit code for this error.
+    ///
+    /// Configuration and parse errors (bad input, bad profile) exit with 2,
+    /// validation failures (the server or plan did not pass checks) with 3,
+    /// and every other failure with 1.
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            PackError::Config(_) | PackError::Parse(_) => 2,
+            PackError::Validation(_) => 3,
+            _ => 1,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_code_mapping() {
+        assert_eq!(PackError::Config("bad".into()).exit_code(), 2);
+        assert_eq!(PackError::Parse("bad".into()).exit_code(), 2);
+        assert_eq!(
+            PackError::Validation("1 error(s) found".into()).exit_code(),
+            3
+        );
+        assert_eq!(PackError::NotFound("x".into()).exit_code(), 1);
+        assert_eq!(PackError::Provider("x".into()).exit_code(), 1);
+        assert_eq!(PackError::Other("x".into()).exit_code(), 1);
+        assert_eq!(
+            PackError::io("read", std::io::Error::other("boom")).exit_code(),
+            1
+        );
+    }
 }
